@@ -82,6 +82,7 @@ def main():
     # Sizing
     parser.add_argument("--target_size", type=float, default=None,
                         help="If set, use this longest-side size (m) instead of random [0.5,2.2]")
+    parser.add_argument("--size_jitter_frac", type=float, default=0.15)
 
     # IoU control
     parser.add_argument("--iou_thresh", type=float, default=0.95, #minimum IoU between composite image and point cloud projection
