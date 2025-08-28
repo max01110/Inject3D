@@ -3,7 +3,7 @@ This repository provides a data generation pipeline to expand a dataset with lid
 
 Note that this data augmentation is not perfect, please double check any **
 
-![alt text](https://github.com/adam-p/markdown-here/raw/master/src/common/images/icon48.png "Logo Title Text 1")
+![alt text](https://github.com/max01110/Inject3D/blob/main/assets/demo.png "Demo images")
 
 
 # 1. Installation
