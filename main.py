@@ -14,6 +14,7 @@ except Exception:
 # Make package importable when run from Blender
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+      
 from anomaly_injector import (
     load_calib,
     clear_scene,
@@ -70,9 +71,9 @@ def main():
     parser.add_argument("--ground_ransac_thresh", type=float, default=0.15) #RANSAC threshold for ground plane fitting -> threshold distance from randomly selected plane (for) to other lidar points (larger num means more robust, but less accurate)
     parser.add_argument("--ground_contact_offset", type=float, default=0.02) #offset above the ground plane to place the object
     parser.add_argument("--yaw_min", type=float, default=0.0) #minimum yaw angle for object placement
-    parser.add_argument("--yaw_max", type=float, default=360.0) #maximum yaw angle for object placement
+    parser.add_argument("--yaw_max", type=float, default=0.0) #maximum yaw angle for object placement
     parser.add_argument("--clearance", type=float, default=0.20) #minimum clearance from other points in the lidar point cloud to insert the object
-    parser.add_argument("--place_tries", type=int, default=200) #number of attempts to place the object without collisions 
+    parser.add_argument("--place_tries", type=int, default=50) #number of attempts to place the object without collisions 
     parser.add_argument("--surf_samples", type=int, default=40000) #number of surface points (from objaverse object) to sample for collision & occlusion checking
     parser.add_argument("--z_margin", type=float, default=0.05) #margin for z-buffer occlusion checking (the object’s depth being at least z_margin closer than the scene depth)
     parser.add_argument("--require_inside_frac", type=float, default=0.85) #fraction of object points that must be inside the image
@@ -140,13 +141,16 @@ def main():
             # Fetch a fresh Objaverse asset each try
             uid, mesh_path = get_random_objaverse(td)
             print(f"Picked UID: {uid} at {mesh_path}")
+            print("DEBUG 1")
 
             # Import & size
             obj_parent = import_mesh(mesh_path)
+            print("DEBUG 2")
             triangulate_and_smooth(obj_parent)
+            print("DEBUG 3")
             target_size = args.target_size if args.target_size is not None else random.uniform(0.5, 2.2)
             fit_object_longest_to(obj_parent, target_size=target_size, jitter_frac=args.size_jitter_frac)
-
+            print("DEBUG 4")
             # Placement on LiDAR ground
             assert args.x_range[0] < args.x_range[1]
             assert args.y_range[0] < args.y_range[1]
@@ -170,7 +174,7 @@ def main():
                 require_inside_frac=args.require_inside_frac,
                 unoccluded_thresh=args.unoccluded_thresh,
             )
-
+            print("DEBUG 5")
             # Configure render (transparent)
             scene = bpy.context.scene
             scene.render.image_settings.file_format = 'PNG'

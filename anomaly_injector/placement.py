@@ -180,12 +180,18 @@ def place_random_on_lidar_ground(obj_parent,
         rand = lambda a, b: float(random.uniform(a, b))
 
     # Fit ground and build KD-tree obstacles
+    print("Debug 4.1")
     xyz = load_lidar_xyz(lidar_bin_path)
+    print("Debug 4.2")
     n, d = fit_ground_plane_ransac(xyz, dist_thresh=ransac_thresh, seed=seed)
+    print("Debug 4.3")
     kdt, _ = build_non_ground_kdtree(xyz, n, d, ground_thresh=ransac_thresh)
+    print("Debug 4.4")
+
 
     best_pose = None
     for _ in range(int(tries)):
+        print(_)
         # Propose XY on ground
         x = rand(*x_range); y = rand(*y_range)
         z = z_on_plane_at_xy(n, d, x, y, fallback_z=np.percentile(xyz[:,2], 5))

@@ -1,0 +1,12 @@
+numpy
+bpy
+tqdm
+opencv-python
+pyyaml
+pandas
+objaverse
+mathutils
+pillow
+matplotlib
+trimesh
+open3d

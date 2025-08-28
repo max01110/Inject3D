@@ -4,9 +4,9 @@ set -euo pipefail
 ### ------------------- USER CONFIG ------------------- ###
 SCRIPT="main.py" 
 CALIB="input/STU_dataset/calib.yaml"                # calibration file
-IMAGES="../train_images/201/port_a_cam_0"                   # input images dir
-LIDAR="../train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train/201/velodyne"  # input lidar dir
-LABELS="../train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train/201/labels"   # input labels dir
+IMAGES="../train_images/206/port_a_cam_0"                   # input images dir
+LIDAR="../train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train/206/velodyne"  # input lidar dir
+LABELS="../train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train/206/labels"   # input labels dir
 OUT_IMAGES="out_images/"           # output augmented images
 OUT_LIDAR="out_lidar/"          # output augmented lidar
 PER_PAIR=1                                 # number of augmentations per pair
