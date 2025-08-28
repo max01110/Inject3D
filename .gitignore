@@ -1,1 +1,4 @@
 out/
+out_images/
+out_lidar/
+anomaly_injector/__pycache__/

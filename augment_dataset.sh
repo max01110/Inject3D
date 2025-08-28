@@ -10,7 +10,7 @@ LABELS="../train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train/201/l
 OUT_IMAGES="out_images/"           # output augmented images
 OUT_LIDAR="out_lidar/"          # output augmented lidar
 PER_PAIR=1                                 # number of augmentations per pair
-IOU_THRESH=0.6                             # IoU threshold
+IOU_THRESH=0.85                             # IoU threshold
 IOU_MAX_TRIES=10                           # max IoU tries per augmentation
 ### --------------------------------------------------- ###
 
