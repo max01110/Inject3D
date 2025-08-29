@@ -8,6 +8,76 @@ Note: This data augmentation is not perfect. Please double-check any generated r
 ![alt text](https://github.com/max01110/Inject3D/blob/main/assets/demo.png "Demo images")
 
 
+# How Inject3D Works
+
+Inject3D takes a LiDAR point cloud + camera image pair and augments them with a random 3D object in a physically consistent way:
+
+**1. Calibration loading**
+
+Reads a YAML file with camera intrinsics (K, distortion, P) and extrinsics (T<sub>LiDAR→Cam</sub>).
+
+Supports just pinhole (plumb_bob) camera models for now.
+
+**2. Scene preparation (Blender)**
+
+- Starts a clean Blender scene.
+
+- Sets up a virtual camera matching the real sensor intrinsics/extrinsics.
+
+- Imports a random 3D mesh from Objaverse  and scales it to a random defined range.
+
+**3. Ground-aware placement**
+
+- Fits a ground plane to the LiDAR cloud using RANSAC.
+
+- Samples a random (x, y) in front of the ego-vehicle.
+
+- Computes z from the ground plane → snaps the object’s lowest point to the ground.
+
+- Orients the object so its largest face lies flat on the ground, then applies a random yaw.
+
+**4. Collision + occlusion checks**
+
+- Builds a KD-tree of non-ground LiDAR points to reject placements that intersect existing obstacles (--clearance).
+
+- Builds a LiDAR-derived z-buffer in camera space to ensure the object is fully visible (no occlusion).
+
+**5. Rendering & compositing**
+
+- Renders the object with transparent background in Blender.
+
+- Warps the render from rectified → distorted image domain (using OpenCV, this is not perfect and is corrected later).
+
+- Alpha-composites the object over the original camera frame.
+
+**6. Point cloud augmentation**
+
+- Samples points from the object’s mesh surface.
+
+- Appends them to the original .bin LiDAR cloud.
+
+- Writes new .bin + .label files with injected points marked as --anomaly_label.
+
+**7. IoU Check/Alignment**
+
+Given that the blender composite can't fully replicate the camera model, we perform a final alignment/check
+
+- Project augmented point cloud on camera frame
+- Check IoU of point cloud object and composite
+- Align composite such that it maximizes IoU
+- (Optional) If final IoU < threshold, reject and restart
+
+**Outputs**
+
+- Augmented image (aug_image_distorted.png).
+
+- Augmented point cloud (aug_lidar.bin).
+
+- Augmented labels (aug_lidar.label).
+
+
+**Disclaimer:** This tool is useful for generating 2D–3D consistent training data (e.g., for voxel-based experiments), but the augmented results are not guaranteed to be perfectly reliable. All generated outputs should be double-checked before use in downstream tasks.
+
 # 1. Installation
 
 
@@ -22,7 +92,7 @@ cd Inject3D
 
 1. Install Blender from [here](https://www.blender.org/download/)
 
-	a) Use Blender version > 2.9
+	a) Use Blender version > 2.9 (we recommend 3.6.5)
 
 
 	b) untar the downloaded zip folder and make note of the path to the Blender folder, the folder structure will look like this:
@@ -60,11 +130,10 @@ cd Inject3D
 
     b) In the ```Dockerfile``` adapt the version of the downloaded blender
 
-2. ```docker build -t inject3d:latest .```
+2. Run ```docker build -t inject3d:latest .```
 
 
 # 2. Setup
-
 
 ## 2.1. Calibration Files
 
@@ -102,7 +171,7 @@ distortion_model supports plumb_bob (a.k.a. radtan) and equidistant (fisheye).
 
 ## 2.2 Point Cloud & Image Pair
 
-**LiDAR point cloud (.bin):** KITTI-style N×3 float32 with columns [x, y, z] in LiDAR frame.
+**LiDAR point cloud (.bin):** KITTI-style N×4 float32 with columns [x, y, z, r] in LiDAR frame (we only use x,y,z)
 
 **Labels (.label):** N × uint32 semantic class IDs aligned 1:1 with the .bin.
 

@@ -10,3 +10,5 @@ pillow
 matplotlib
 trimesh
 open3d
+pygltflib
+transforms3d
