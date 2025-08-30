@@ -130,7 +130,11 @@ cd Inject3D
 
     b) In the ```Dockerfile``` adapt the version of the downloaded blender
 
-2. Run ```docker build -t inject3d:latest .```
+2. Build docker container 
+    ```
+    cd docker
+    sudo docker build --build-arg USERNAME=$USER -t inject3d:latest .
+    ```
 
 
 # 2. Setup

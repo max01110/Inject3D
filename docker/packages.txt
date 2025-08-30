@@ -16,5 +16,4 @@ curl
 libx11-6 
 libxi6 
 libxext6 
-ibxxf86vm1 
 libnvidia-gl-570
