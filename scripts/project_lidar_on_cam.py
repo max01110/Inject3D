@@ -9,8 +9,6 @@ import numpy as np
 import yaml
 
 
-# ============================ Math / Transforms ============================
-
 def quat_to_R(x, y, z, w):
     q = np.array([x, y, z, w], dtype=np.float64)
     nq = q @ q
@@ -26,7 +24,6 @@ def quat_to_R(x, y, z, w):
 
 
 def euler_cam_frame(yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
-    """Extra tweak rotation in CAMERA frame (X right, Y down, Z forward)."""
     rz, ry, rx = map(np.deg2rad, (yaw_deg, pitch_deg, roll_deg))
     cz, sz = np.cos(rz), np.sin(rz)
     cy, sy = np.cos(ry), np.sin(ry)
@@ -37,15 +34,10 @@ def euler_cam_frame(yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
     return Rz @ Ry @ Rx
 
 
-# ============================ YAML / Extrinsics ============================
+#YAML/Extrinsics 
 
 def _find_static_transform(cfg, desired_child):
-    """
-    Find LiDAR->Camera static transform with priority:
-      1) exact child == desired_child
-      2) first child containing 'camera' or 'port_a_camera'
-      3) first transform with parent 'os_sensor'
-    """
+
     best = exact = camera_like = None
     for st in cfg.get("static_transforms", []):
         if st.get("parent") != "os_sensor":
@@ -60,7 +52,7 @@ def _find_static_transform(cfg, desired_child):
     return exact or camera_like or best
 
 
-def load_yaml_and_extrinsics(calib_path, interpret_as_lidar_to_cam=False):
+def load_yaml_and_extrinsics(calib_path):
     with open(calib_path, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -93,11 +85,7 @@ def load_yaml_and_extrinsics(calib_path, interpret_as_lidar_to_cam=False):
     R_lc = quat_to_R(float(q["x"]), float(q["y"]), float(q["z"]), float(q["w"]))
     t_lc = np.array([float(t["x"]), float(t["y"]), float(t["z"])], dtype=np.float64)
 
-    # Return Camera<-LiDAR transform (LiDAR -> Camera)
-    if interpret_as_lidar_to_cam:
-        R_cl, t_cl = R_lc, t_lc
-    else:
-        R_cl, t_cl = R_lc.T, -R_lc.T @ t_lc
+    R_cl, t_cl = R_lc.T, -R_lc.T @ t_lc
 
     return {
         "model": model,
@@ -112,7 +100,7 @@ def load_yaml_and_extrinsics(calib_path, interpret_as_lidar_to_cam=False):
     }
 
 
-# ============================ Point loading ============================
+#Point loading
 
 def _sibling_bin_path(label_path: Path):
     cand = label_path.with_suffix(".bin")
@@ -153,11 +141,6 @@ def load_points_and_labels(label_path: Path):
 
 # ============================ Projection models ============================
 
-def project_fisheye(points_cam, K, D):
-    obj = points_cam.astype(np.float64).reshape(-1, 1, 3)
-    rvec = np.zeros((3, 1)); tvec = np.zeros((3, 1))
-    uv, _ = cv2.fisheye.projectPoints(obj, rvec, tvec, K.astype(np.float64), D.astype(np.float64))
-    return uv.reshape(-1, 2)
 
 
 def project_plumb_bob(points_cam, K, D):
@@ -168,16 +151,8 @@ def project_plumb_bob(points_cam, K, D):
     return uv.reshape(-1, 2)
 
 
-def project_linear_P(points_cam, P):
-    """Rectified linear projection using 3x4 P (no distortion)."""
-    X = np.hstack([points_cam.astype(np.float64), np.ones((len(points_cam), 1))])  # Nx4
-    PX = P @ X.T  # 3xN
-    w = PX[2, :]
-    w[w == 0] = 1e-12
-    return np.stack([PX[0, :] / w, PX[1, :] / w], axis=1)
 
-
-# ============================ Colors & Rendering ============================
+#Colors & Rendering 
 
 def hsv_to_rgb(h, s, v):
     i = int(h * 6)
@@ -250,7 +225,7 @@ def render_overlay(width, height, uv, labels, bg_img=None, dot_size=1,
     return np.dstack([color, alpha])
 
 
-# ============================ Main ============================
+# Main ============================
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -263,12 +238,6 @@ def parse_args():
     ap.add_argument("--max_depth", type=float, default=200.0)
     ap.add_argument("--dot_size", type=int, default=3)
 
-    # interpretation toggle + post-rot tweaks
-    ap.add_argument(
-        "--interpret_as_lidar_to_cam",
-        action="store_true",
-        help="Treat YAML static transform as LiDAR→Camera (no inversion).",
-    )
     ap.add_argument("--yaw_deg", type=float, default=0.0)
     ap.add_argument("--pitch_deg", type=float, default=0.0)
     ap.add_argument("--roll_deg", type=float, default=0.0)
@@ -279,15 +248,12 @@ def parse_args():
     ap.add_argument("--palette_s", type=float, default=0.35)
     ap.add_argument("--palette_v", type=float, default=0.75)
 
-    # choose projection route
-    ap.add_argument("--use_P", action="store_true",
-                    help="Project with rectified 3x4 P (no distortion). Overrides model/K/D.")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
-    cfg = load_yaml_and_extrinsics(args.calib, args.interpret_as_lidar_to_cam)
+    cfg = load_yaml_and_extrinsics(args.calib)
 
     K, D, P = cfg["K"], cfg["D"], cfg["P"]
     W, H = cfg["width"], cfg["height"]
@@ -299,7 +265,7 @@ def main():
         idx = np.random.RandomState(0).choice(len(pts_l), size=args.max_points, replace=False)
         pts_l, labels = pts_l[idx], labels[idx]
 
-    # LiDAR → Camera (with optional camera-frame tweak)
+    # LiDAR -> Camera
     pts_c = (R_cl @ pts_l.T).T + t_cl
     R_fix = euler_cam_frame(args.yaw_deg, args.pitch_deg, args.roll_deg)
     pts_c = (R_fix @ pts_c.T).T
@@ -308,19 +274,14 @@ def main():
     z = pts_c[:, 2]
     m = (z > max(args.min_depth, 1e-6)) & (z < args.max_depth)
     pts_c, labels = pts_c[m], labels[m]
+
     if len(pts_c) == 0:
         sys.exit("No points after depth filtering; try different transform/yaw/pitch/roll.")
 
-    # Projection selection
-    if args.use_P and P is not None:
-        uv, used = project_linear_P(pts_c, P), "P (rectified, no distortion)"
-    else:
-        if model in ("equidistant", "fisheye"):
-            uv, used = project_fisheye(pts_c, K, D), "fisheye/equidistant"
-        else:
-            uv, used = project_plumb_bob(pts_c, K, D), "plumb_bob (radtan)"
 
-    # Optional background
+    uv, used = project_plumb_bob(pts_c, K, D), "plumb_bob (radtan)"
+
+    #optional background
     bg = cv2.imread(args.image, cv2.IMREAD_COLOR) if args.image else None
     if args.image and bg is None:
         print(f"Warning: could not read background image: {args.image}")
@@ -342,7 +303,6 @@ def main():
         f"  model={model}, used_projection={used}\n"
         f"  anomaly_label={args.anomaly_label}, anomaly_color={args.anomaly_color}\n"
         f"  palette_s={args.palette_s}, palette_v={args.palette_v}\n"
-        f"  interpret_as_lidar_to_cam={args.interpret_as_lidar_to_cam}\n"
         f"  yaw/pitch/roll=({args.yaw_deg}, {args.pitch_deg}, {args.roll_deg})"
     )
 

@@ -23,10 +23,8 @@ def build_scene_zbuffer_from_lidar(lidar_bin_path, T_lidar_cam, model, K, D, wid
     # Project to pixels 
     obj = pts_c.reshape(-1,1,3).astype(np.float64)
     rvec = np.zeros((3,1)); tvec = np.zeros((3,1))
-    if model.lower() in ["equidistant", "fisheye"]:
-        uv, _ = cv2.fisheye.projectPoints(obj, rvec, tvec, K.astype(np.float64), D.astype(np.float64))
-    else:
-        uv, _ = cv2.projectPoints(obj, rvec, tvec, K.astype(np.float64), D.reshape(-1,1))
+
+    uv, _ = cv2.projectPoints(obj, rvec, tvec, K.astype(np.float64), D.reshape(-1,1))
     uv = uv.reshape(-1, 2)
 
     u = np.round(uv[:,0]).astype(np.int32)
@@ -61,10 +59,8 @@ def project_world_points_to_cam_uv(points_world, T_lidar_cam, model, K, D):
     z = pts_c[:,2]
     obj = pts_c.reshape(-1,1,3).astype(np.float64)
     rvec = np.zeros((3,1)); tvec = np.zeros((3,1))
-    if model.lower() in ["equidistant", "fisheye"]:
-        uv, _ = cv2.fisheye.projectPoints(obj, rvec, tvec, K.astype(np.float64), D.astype(np.float64))
-    else:
-        uv, _ = cv2.projectPoints(obj, rvec, tvec, K.astype(np.float64), D.reshape(-1,1))
+
+    uv, _ = cv2.projectPoints(obj, rvec, tvec, K.astype(np.float64), D.reshape(-1,1))
     return uv.reshape(-1,2).astype(np.float32), z.astype(np.float32)
 
 def fraction_unoccluded(obj_parent, zbuf, T_lidar_cam, model, K, D, width, height,

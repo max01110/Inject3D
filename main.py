@@ -86,7 +86,7 @@ def main():
     parser.add_argument("--size_jitter_frac", type=float, default=0.15)
 
     # IoU control
-    parser.add_argument("--iou_thresh", type=float, default=0.95, #minimum IoU between composite image and point cloud projection
+    parser.add_argument("--iou_thresh", type=float, default=0.92, #minimum IoU between composite image and point cloud projection
                         help="Post-alignment IoU required to accept the object (default: 0.60)") 
     parser.add_argument("--iou_max_tries", type=int, default=10,  #max number of retries before script stops if IoU is below threshold
                         help="Max fresh-object attempts if IoU is below threshold (default: 10)")
@@ -99,7 +99,6 @@ def main():
 
     # Load calib once
     model, K, D, width, height, T_lidar_cam, P = load_calib(args.calib)
-    print(f"distortion_model={model}")
 
     # Clear scene and set camera/lights once
     clear_scene()
@@ -141,16 +140,12 @@ def main():
             # Fetch a fresh Objaverse asset each try
             uid, mesh_path = get_random_objaverse(td)
             print(f"Picked UID: {uid} at {mesh_path}")
-            print("DEBUG 1")
 
             # Import & size
             obj_parent = import_mesh(mesh_path)
-            print("DEBUG 2")
             triangulate_and_smooth(obj_parent)
-            print("DEBUG 3")
             target_size = args.target_size if args.target_size is not None else random.uniform(0.5, 2.2)
             fit_object_longest_to(obj_parent, target_size=target_size, jitter_frac=args.size_jitter_frac)
-            print("DEBUG 4")
             # Placement on LiDAR ground
             assert args.x_range[0] < args.x_range[1]
             assert args.y_range[0] < args.y_range[1]
@@ -174,7 +169,6 @@ def main():
                 require_inside_frac=args.require_inside_frac,
                 unoccluded_thresh=args.unoccluded_thresh,
             )
-            print("DEBUG 5")
             # Configure render (transparent)
             scene = bpy.context.scene
             scene.render.image_settings.file_format = 'PNG'
@@ -222,7 +216,7 @@ def main():
 
                 # Decide: accept or retry with a new object
                 if iou_after >= args.iou_thresh:
-                    print(f"✓ IoU {iou_after:.3f} ≥ threshold {args.iou_thresh:.3f} — accepting object.")
+                    print(f"IoU {iou_after:.3f} ≥ threshold {args.iou_thresh:.3f} — accepting object.")
                     # Write final composites
                     out_fit_path = os.path.join(args.outdir, "aug_image.png")
                     cv2.imwrite(out_fit_path, alpha_composite_rgba_over_bgr(rgba_fit, bg_bgr))
@@ -235,14 +229,14 @@ def main():
                     out_label = os.path.join(args.outdir, "aug_lidar.label")
                     write_augmented_pointcloud(args.lidar, args.labels, pts_mesh,
                                                args.anomaly_label, out_bin, out_label)
-                    print(f"   Saved: {out_fit_path}")
-                    print(f"   Saved: {out_bin} and {out_label}")
+                    print(f"Saved: {out_fit_path}")
+                    print(f"Saved: {out_bin} and {out_label}")
 
                     best_report = (iou_before, iou_after, sx, sy, dx, dy)
                     accepted = True
                     break
                 else:
-                    print(f"✗ IoU {iou_after:.3f} < threshold {args.iou_thresh:.3f} — retrying with a new object.")
+                    print(f"IoU {iou_after:.3f} < threshold {args.iou_thresh:.3f} — retrying with a new object.")
             finally:
                 # Remove the temp RGBA file for this attempt
                 try:

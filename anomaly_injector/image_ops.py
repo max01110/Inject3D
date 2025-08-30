@@ -15,10 +15,7 @@ def build_rectified_to_distorted_map(model, K, D, width, height, K_rect=None):
                          np.arange(H, dtype=np.float64))
     pts_d = np.stack([uu, vv], axis=-1).reshape(-1,1,2)
 
-    if model in ["equidistant", "fisheye"]:
-        rect_pix = cv2.fisheye.undistortPoints(pts_d, K, D, R=np.eye(3), P=K_rect)
-    else:
-        rect_pix = cv2.undistortPoints(pts_d, K, D, R=np.eye(3), P=K_rect)
+    rect_pix = cv2.undistortPoints(pts_d, K, D, R=np.eye(3), P=K_rect)
 
     rect_pix = rect_pix.reshape(H, W, 2).astype(np.float32)
     return rect_pix[...,0], rect_pix[...,1]

@@ -65,7 +65,9 @@ Given that the blender composite can't fully replicate the camera model, we perf
 - Project augmented point cloud on camera frame
 - Check IoU of point cloud object and composite
 - Align composite such that it maximizes IoU
-- (Optional) If final IoU < threshold, reject and restart
+- If final IoU < threshold, reject and restart
+
+In practice, we find that using an IoU threshold of 0.92 provides a good balance — it yields results that are nearly perfect while avoiding excessive retries. Achieving a true 100% IoU is unrealistic given the inherent differences between LiDAR point clouds and image-based renderings, so 0.92 serves as a practical compromise. However, feel free to experiment and adapt this as needed.
 
 **Outputs**
 
@@ -184,29 +186,50 @@ The pipeline appends new points for the injected mesh and labels them with --ano
 **Image:** The raw distorted RGB frame corresponding to the LiDAR sweep (PNG/JPG).
 
 # 3. Usage
+For a list of possible arguments to customize and adapt your augmented dataset, please see ```main.py```
 
 ## 3.1 Local
 
 ```bash
 BLENDER=/path/to/blender
 
-$BLENDER -b --python scripts/inject_and_render.py -- \
-  --calib input/STU_dataset/calib.yaml \
-  --image input/STU_dataset/images/000448.png \
-  --lidar input/STU_dataset/lidar/000448.bin \
-  --labels input/STU_dataset/labels/000448.label \
+$BLENDER -b --python main.py -- --calib input/STU_dataset/calib.yaml --image input/STU_dataset/000000.png --lidar input/STU_dataset/000000.bin --labels input/STU_dataset/000000.label     --outdir out/000000
 ```
-For a list of possible arguments to customize and adapt your augmented dataset, please see ```main.py```
+
 
 ## 3.2 Docker
 
 ```bash
 docker run --gpus all --rm -it -v $(pwd):/workspace inject3d:latest bash -lc 
 
-blender-3.6.5-linux-x64/blender -b --python scripts/inject_and_render.py -- \
-    --calib input/STU_dataset/calib.yaml \
-    --image input/STU_dataset/images/000448.png \
-    --lidar input/STU_dataset/lidar/000448.bin \
-    --labels input/STU_dataset/labels/000448.label \
-    --outdir out/000448 \
+cd /workspace
+
+blender -b --python main.py -- --calib input/STU_dataset/calib.yaml --image input/STU_dataset/000000.png --lidar input/STU_dataset/000000.bin --labels input/STU_dataset/000000.label     --outdir out/000000
+```
+
+# 4 Extra Tools
+
+## 4.1 Point Cloud Projection on Camera
+We provide a script to project the lidar points onto the camera frame as a check to ensure the augmented object is inserted properly.
+
+To use this script run:
+
+```bash
+python scripts/project_lidar_on_cam.py --label out/000000.png/aug_lidar.label --calib input/STU_dataset/calib.yaml --out projection.png --image input/STU_dataset/000000.png 
+```
+
+Please refer to the script for more info on specific optional arugments you can pass in
+
+
+## 4.2 Dataset Augment
+
+We also provid a script to augment a directory of image-lidar pairs.
+
+Configure your settings inside the bash script ```scripts/augment_dataset.sh``
+
+Then, run:
+
+```bash
+chmod +x scripts/augment_dataset.sh
+./augment_dataset.sh
 ```
