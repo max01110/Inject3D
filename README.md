@@ -1,5 +1,5 @@
 # Inject3D
-This repository provides a data generation pipeline to expand a dataset with lidar and image pairs with random objects in geometrically and spatially consistnet locations
+This repository provides a data generation pipeline to expand a dataset with lidar and image pairs with random objects in geometrically and spatially consistent locations
 
 The pipeline is designed for anomaly/data augmentation experiments in autonomous driving, robotics, and 3D vision research.
 
