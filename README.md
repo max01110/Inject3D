@@ -154,7 +154,6 @@ camera_intrinsics:
   K: [fx, 0, cx, 0, fy, cy, 0, 0, 1]   # 3x3 row-major
   D: [k1, k2, p1, p2, k3]              # radtan (plumb_bob)
   # For fisheye/equidistant use [k1, k2, k3, k4]
-  # Optional rectified projection (left 3x3 used if --use_P_for_rect):
   P: [fxp, 0, cxp, 0, 0, fyp, cyp, 0, 0, 0, 1, 0]  # 3x4 row-major
 
 # Extrinsics: camera w.r.t. LiDAR/world ("os_sensor")
