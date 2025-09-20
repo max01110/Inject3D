@@ -4,6 +4,31 @@ from mathutils import Vector, Quaternion
 from .mesh_ops import _gather_world_vertices
 from .collision import build_non_ground_kdtree, has_collision_with_scene
 from .occlusion import fraction_unoccluded
+from .proj_ops import invert_lidar_cam
+
+
+def _world_to_blender_cam(p_world, T_lidar_cam):
+    """
+    Convert world/LiDAR point to Blender camera frame used by print_relative:
+    - Camera looks along -Z, +Y is up, +X is right.
+    The Blender camera rotation is R_world_cam_bl = R_lidar_cam @ R_fix with
+    R_fix = diag(1,-1,-1).
+    """
+    R_lc = T_lidar_cam[:3, :3]
+    t_lc = T_lidar_cam[:3, 3]
+    R_fix = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
+    R_wcam_bl = R_lc @ R_fix                   # world->camera (blender) rotation
+    R_blcam_w = R_wcam_bl.T                    # inverse rotation
+    return R_blcam_w @ (p_world - t_lc)
+
+
+def _blender_cam_to_world(p_cam_bl, T_lidar_cam):
+    """Convert Blender camera-frame point to world/LiDAR coordinates."""
+    R_lc = T_lidar_cam[:3, :3]
+    t_lc = T_lidar_cam[:3, 3]
+    R_fix = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
+    R_wcam_bl = R_lc @ R_fix
+    return R_wcam_bl @ p_cam_bl + t_lc
 
 def load_lidar_xyz(lidar_bin_path):
     """Return (N,3) XYZ from a KITTI-style lidar.bin (Nx4 float32)."""
@@ -155,6 +180,29 @@ def snap_object_bottom_to_plane(obj_parent, n, d, contact_offset=0.02):
     obj_parent.matrix_world = mw
 
 
+def _reorient_plane_to_camera(n, d, T_lidar_cam):
+    """
+    Ensure ground plane is below the camera:
+    - In Blender camera frame, ground normal should have positive Y (points 'up').
+    - Camera should lie above the plane along the ground normal (signed distance > 0).
+    Returns possibly flipped (n, d).
+    """
+    try:
+        n = np.asarray(n, dtype=np.float64)
+        R_lc = T_lidar_cam[:3, :3]
+        t_lc = T_lidar_cam[:3, 3]
+        R_fix = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
+        R_wcam_bl = R_lc @ R_fix
+        R_blcam_w = R_wcam_bl.T
+        n_cam_bl = R_blcam_w @ n
+        s_cam = float(n @ t_lc + d)
+        if (n_cam_bl[1] <= 0.0) or (s_cam <= 0.0):
+            n = -n
+            d = -float(d)
+        return n, float(d)
+    except Exception:
+        return n, d
+
 def place_random_on_lidar_ground(obj_parent,
                                  lidar_bin_path,
                                  x_range=(4.0, 12.0),
@@ -164,8 +212,8 @@ def place_random_on_lidar_ground(obj_parent,
                                  contact_offset=0.02,
                                  yaw_range_deg=(0.0, 360.0),
                                  clearance=0.20,
-                                 tries=200,
-                                 n_surface_samples=4000,
+                                 tries=120,
+                                 n_surface_samples=2500,
                                  avoid_occlusion=False,
                                  zbuf=None,
                                  T_lidar_cam=None,
@@ -182,6 +230,8 @@ def place_random_on_lidar_ground(obj_parent,
     # Fit ground and build KD-tree obstacles
     xyz = load_lidar_xyz(lidar_bin_path)
     n, d = fit_ground_plane_ransac(xyz, dist_thresh=ransac_thresh, seed=seed)
+    if T_lidar_cam is not None:
+        n, d = _reorient_plane_to_camera(n, d, T_lidar_cam)
     kdt, _ = build_non_ground_kdtree(xyz, n, d, ground_thresh=ransac_thresh)
 
 
@@ -200,18 +250,39 @@ def place_random_on_lidar_ground(obj_parent,
                                       yaw_range_deg=yaw_range_deg, seed=seed)
         snap_object_bottom_to_plane(obj_parent, n, d, contact_offset=contact_offset)
 
+        # Enforce: object must be below the camera in Blender camera Y (y_cam < 0)
+        if T_lidar_cam is not None:
+            try:
+                p_world = np.array(list(obj_parent.matrix_world.translation), dtype=np.float64)
+                p_cam_bl = _world_to_blender_cam(p_world, T_lidar_cam)
+                if not (p_cam_bl[1] < 0.0):
+                    # Reject this sample if it's not below the camera
+                    continue
+            except Exception:
+                pass
+
         # Collision check vs scene
         if has_collision_with_scene(obj_parent, kdt, clearance=clearance, n_samples=n_surface_samples):
             continue
 
         #Occlusion rejection
         if avoid_occlusion:
+            # Use fewer samples for a faster visibility test
+            fast_samples = int(min(max(800, 0.25 * n_surface_samples), 3000))
             inside_frac, unocc_frac = fraction_unoccluded(
                 obj_parent, zbuf, T_lidar_cam, model, K, D, width, height,
-                n_surface_samples=min(n_surface_samples, 6000),  # cap for speed
+                n_surface_samples=fast_samples,
                 z_margin=z_margin,
                 require_inside_frac=require_inside_frac
             )
+            # Optional refine if borderline (disabled by default for speed)
+            # if inside_frac >= require_inside_frac and (unocc_frac < unoccluded_thresh + 0.05):
+            #     inside_frac, unocc_frac = fraction_unoccluded(
+            #         obj_parent, zbuf, T_lidar_cam, model, K, D, width, height,
+            #         n_surface_samples=min(n_surface_samples, 6000),
+            #         z_margin=z_margin,
+            #         require_inside_frac=require_inside_frac
+            #     )
             # Require enough of the object to be actually visible,
             # and all visible samples to be unoccluded (or above threshold)
             if inside_frac < require_inside_frac:
@@ -223,9 +294,45 @@ def place_random_on_lidar_ground(obj_parent,
         break
 
     if best_pose is None:
-        print(f"[WARN] Could not find a collision- and occlusion-free placement in {tries} tries; keeping last pose.")
+        print(f"[WARN] Could not find a valid placement in {tries} tries. Applying manual fallback placement in front of and below the camera.")
+
+        # Manual fallback: place at a fixed Blender-camera-relative location (no snap/orient)
+        # Blender camera convention: looking along -Z, X right, Y up. We want Y<0 and Z<0.
+        if T_lidar_cam is not None:
+            try:
+                # Desired point in camera frame (meters)
+                p_c_bl = np.array([0.0, -2.0, -8.0], dtype=np.float64)
+                # Transform to LiDAR/world frame using Blender camera convention
+                p_l = _blender_cam_to_world(p_c_bl, T_lidar_cam)
+                # Directly set world translation
+                mw_fb = obj_parent.matrix_world.copy()
+                mw_fb.translation = Vector((float(p_l[0]), float(p_l[1]), float(p_l[2])))
+                obj_parent.matrix_world = mw_fb
+
+                best_pose = obj_parent.matrix_world.copy()
+            except Exception as e:
+                print(f"[WARN] Manual fallback placement failed: {e}. Keeping last pose.")
+                best_pose = None
+        else:
+            print("[WARN] No T_lidar_cam provided; cannot compute camera-relative fallback.")
+            best_pose = None
     else:
         obj_parent.matrix_world = best_pose
+
+        # Final validation: ensure below camera (y_cam < 0). If not, override with manual fallback.
+        if T_lidar_cam is not None:
+            try:
+                p_world = np.array(list(obj_parent.matrix_world.translation), dtype=np.float64)
+                p_cam_bl = _world_to_blender_cam(p_world, T_lidar_cam)
+                if not (p_cam_bl[1] < 0.0):
+                    # Directly set a fixed camera-relative position
+                    p_c_bl = np.array([0.0, -2.0, -8.0], dtype=np.float64)
+                    p_l = _blender_cam_to_world(p_c_bl, T_lidar_cam)
+                    mw_fb = obj_parent.matrix_world.copy()
+                    mw_fb.translation = Vector((float(p_l[0]), float(p_l[1]), float(p_l[2])))
+                    obj_parent.matrix_world = mw_fb
+            except Exception:
+                pass
 
 
 

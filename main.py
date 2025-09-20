@@ -7,6 +7,7 @@ sys.path.append(os.path.dirname(__file__))
 
 try:
     import bpy
+    from mathutils import Vector
 except Exception:
         print("This script must be run from inside Blender (has to import bpy).")
         sys.exit(1)
@@ -30,7 +31,15 @@ from anomaly_injector.proj_ops import invert_lidar_cam, project_points_distorted
 from anomaly_injector.objaverse_io import get_random_objaverse
 from anomaly_injector.io_utils import write_augmented_pointcloud
 from anomaly_injector.occlusion import build_scene_zbuffer_from_lidar
-from anomaly_injector.placement import place_random_on_lidar_ground
+from anomaly_injector.placement import (
+    place_random_on_lidar_ground,
+    load_lidar_xyz,
+    fit_ground_plane_ransac,
+    z_on_plane_at_xy,
+    orient_largest_face_to_ground,
+    snap_object_bottom_to_plane,
+    _reorient_plane_to_camera,
+)
 from anomaly_injector.blender_utils import print_pose, print_camera_intrinsics, print_relative
 from anomaly_injector.image_ops import composite_over_background
 from anomaly_injector.mesh_ops import fit_object_longest_to, _collect_world_triangles, _sample_points_on_triangles_world
@@ -169,6 +178,34 @@ def main():
                 require_inside_frac=args.require_inside_frac,
                 unoccluded_thresh=args.unoccluded_thresh,
             )
+            # Print camera-frame translation (pre-safety) using the same method as print_relative
+            cam = bpy.context.scene.camera
+            obj = bpy.data.objects.get("ObjaverseAsset") or obj_parent
+            M_cam_inv = cam.matrix_world.inverted()
+            t_cam_obj = (M_cam_inv @ obj.matrix_world).to_translation()
+            print(f"[DEBUG] Before safety: cam-frame translation = ({t_cam_obj.x:.3f}, {t_cam_obj.y:.3f}, {t_cam_obj.z:.3f})")
+            # Final safety: if object ends up above the camera (y_cam >= 0), force a preset placement
+            if t_cam_obj.y >= -0.4:
+                print("[WARN] Object above camera after placement; setting to fixed camera-relative location.")
+                # Set directly to a fixed Blender camera-frame location (no snap/orient)
+                p_c = Vector((0.0, -1.5, -12.0))
+                p_w = cam.matrix_world @ p_c
+                mw_fb = obj.matrix_world.copy()
+                mw_fb.translation = Vector((float(p_w.x), float(p_w.y), float(p_w.z)))
+                obj.matrix_world = mw_fb
+                # Recompute and print post-safety camera-frame translation
+                M_cam_inv = cam.matrix_world.inverted()
+                t_cam_obj = (M_cam_inv @ obj.matrix_world).to_translation()
+                print(f"[DEBUG] After safety: cam-frame translation = ({t_cam_obj.x:.3f}, {t_cam_obj.y:.3f}, {t_cam_obj.z:.3f})")
+
+            # Optional: verify ground plane orientation — ensure it's below camera
+            xyz_lidar = load_lidar_xyz(args.lidar)
+            n_raw, d_raw = fit_ground_plane_ransac(xyz_lidar, dist_thresh=args.ground_ransac_thresh)
+            n_fix, d_fix = _reorient_plane_to_camera(n_raw, d_raw, T_lidar_cam)
+            if (n_fix is not None) and (d_fix is not None):
+                cam_pt = cam.matrix_world.translation
+                s = float(n_fix[0]*cam_pt.x + n_fix[1]*cam_pt.y + n_fix[2]*cam_pt.z + d_fix)
+                print(f"[DEBUG] Ground plane signed dist at camera (should be >0): {s:.4f}")
             # Configure render (transparent)
             scene = bpy.context.scene
             scene.render.image_settings.file_format = 'PNG'
