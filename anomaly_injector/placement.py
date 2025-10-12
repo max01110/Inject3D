@@ -300,8 +300,9 @@ def place_random_on_lidar_ground(obj_parent,
         # Blender camera convention: looking along -Z, X right, Y up. We want Y<0 and Z<0.
         if T_lidar_cam is not None:
             try:
-                # Desired point in camera frame (meters)
-                p_c_bl = np.array([0.0, -2.0, -8.0], dtype=np.float64)
+                # Desired point in camera frame (meters) - random distance within x_range
+                random_z = random.uniform(x_range[0], x_range[1])
+                p_c_bl = np.array([0.0, -2.0, -random_z], dtype=np.float64)
                 # Transform to LiDAR/world frame using Blender camera convention
                 p_l = _blender_cam_to_world(p_c_bl, T_lidar_cam)
                 # Directly set world translation
@@ -325,8 +326,9 @@ def place_random_on_lidar_ground(obj_parent,
                 p_world = np.array(list(obj_parent.matrix_world.translation), dtype=np.float64)
                 p_cam_bl = _world_to_blender_cam(p_world, T_lidar_cam)
                 if not (p_cam_bl[1] < 0.0):
-                    # Directly set a fixed camera-relative position
-                    p_c_bl = np.array([0.0, -2.0, -8.0], dtype=np.float64)
+                    # Directly set a random camera-relative position within x_range
+                    random_z = random.uniform(x_range[0], x_range[1])
+                    p_c_bl = np.array([0.0, -2.0, -random_z], dtype=np.float64)
                     p_l = _blender_cam_to_world(p_c_bl, T_lidar_cam)
                     mw_fb = obj_parent.matrix_world.copy()
                     mw_fb.translation = Vector((float(p_l[0]), float(p_l[1]), float(p_l[2])))

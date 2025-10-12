@@ -186,9 +186,10 @@ def main():
             print(f"[DEBUG] Before safety: cam-frame translation = ({t_cam_obj.x:.3f}, {t_cam_obj.y:.3f}, {t_cam_obj.z:.3f})")
             # Final safety: if object ends up above the camera (y_cam >= 0), force a preset placement
             if t_cam_obj.y >= -0.4:
-                print("[WARN] Object above camera after placement; setting to fixed camera-relative location.")
-                # Set directly to a fixed Blender camera-frame location (no snap/orient)
-                p_c = Vector((0.0, -1.5, -12.0))
+                print("[WARN] Object above camera after placement; setting to random camera-relative location.")
+                # Set directly to a random Blender camera-frame location within x_range (no snap/orient)
+                random_z = random.uniform(args.x_range[0], args.x_range[1])
+                p_c = Vector((0.0, -1.5, -random_z))
                 p_w = cam.matrix_world @ p_c
                 mw_fb = obj.matrix_world.copy()
                 mw_fb.translation = Vector((float(p_w.x), float(p_w.y), float(p_w.z)))
