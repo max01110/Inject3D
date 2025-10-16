@@ -30,7 +30,8 @@ from anomaly_injector import (
 from anomaly_injector.proj_ops import invert_lidar_cam, project_points_distorted, mask_from_points, estimate_affine_scale_translate, warp_rgba_affine_scale_translate, compute_iou
 from anomaly_injector.objaverse_io import get_random_objaverse
 from anomaly_injector.io_utils import write_augmented_pointcloud
-from anomaly_injector.occlusion import build_scene_zbuffer_from_lidar
+from anomaly_injector.occlusion import build_scene_zbuffer_from_lidar, fraction_unoccluded
+from anomaly_injector.collision import has_collision_with_scene, build_non_ground_kdtree
 from anomaly_injector.placement import (
     place_random_on_lidar_ground,
     load_lidar_xyz,
@@ -82,7 +83,7 @@ def main():
     parser.add_argument("--yaw_min", type=float, default=0.0) #minimum yaw angle for object placement
     parser.add_argument("--yaw_max", type=float, default=0.0) #maximum yaw angle for object placement
     parser.add_argument("--clearance", type=float, default=0.20) #minimum clearance from other points in the lidar point cloud to insert the object
-    parser.add_argument("--place_tries", type=int, default=50) #number of attempts to place the object without collisions 
+    parser.add_argument("--place_tries", type=int, default=1) #number of attempts to place the object without collisions 
     parser.add_argument("--surf_samples", type=int, default=40000) #number of surface points (from objaverse object) to sample for collision & occlusion checking
     parser.add_argument("--z_margin", type=float, default=0.05) #margin for z-buffer occlusion checking (the object’s depth being at least z_margin closer than the scene depth)
     parser.add_argument("--require_inside_frac", type=float, default=0.85) #fraction of object points that must be inside the image
@@ -155,6 +156,7 @@ def main():
             triangulate_and_smooth(obj_parent)
             target_size = args.target_size if args.target_size is not None else random.uniform(0.5, 2.2)
             fit_object_longest_to(obj_parent, target_size=target_size, jitter_frac=args.size_jitter_frac)
+      
             # Placement on LiDAR ground
             assert args.x_range[0] < args.x_range[1]
             assert args.y_range[0] < args.y_range[1]
@@ -184,16 +186,44 @@ def main():
             M_cam_inv = cam.matrix_world.inverted()
             t_cam_obj = (M_cam_inv @ obj.matrix_world).to_translation()
             print(f"[DEBUG] Before safety: cam-frame translation = ({t_cam_obj.x:.3f}, {t_cam_obj.y:.3f}, {t_cam_obj.z:.3f})")
-            # Final safety: if object ends up above the camera (y_cam >= 0), force a preset placement
+            # Final safety: if object ends up above the camera (y_cam >= 0), try multiple random placements
             if t_cam_obj.y >= -0.4:
-                print("[WARN] Object above camera after placement; setting to random camera-relative location.")
-                # Set directly to a random Blender camera-frame location within x_range (no snap/orient)
-                random_z = random.uniform(args.x_range[0], args.x_range[1])
-                p_c = Vector((0.0, -1.5, -random_z))
-                p_w = cam.matrix_world @ p_c
-                mw_fb = obj.matrix_world.copy()
-                mw_fb.translation = Vector((float(p_w.x), float(p_w.y), float(p_w.z)))
-                obj.matrix_world = mw_fb
+                print("[WARN] Object above camera after placement; trying random camera-relative locations.")
+                fallback_tries = 50
+                for fallback_attempt in range(fallback_tries):
+                    try:
+                        # Set directly to a random Blender camera-frame location within x_range (no snap/orient)
+                        random_z = random.uniform(args.x_range[0], args.x_range[1])
+                        random_y = random.uniform(args.y_range[0], args.y_range[1])
+                        p_c = Vector((random_y, -1.65, -random_z))
+                        p_w = cam.matrix_world @ p_c
+                        mw_fb = obj.matrix_world.copy()
+                        mw_fb.translation = Vector((float(p_w.x), float(p_w.y), float(p_w.z)))
+                        obj.matrix_world = mw_fb
+                        
+                        # Check collision with scene
+                        if has_collision_with_scene(obj, kdt, clearance=args.clearance, n_samples=args.surf_samples):
+                            continue  # Try another random position
+                        
+                        # Check occlusion if zbuf is available
+                        if zbuf is not None:
+                            inside_frac, unoccluded_frac = fraction_unoccluded(
+                                obj, zbuf, T_lidar_cam, model, K, D, width, height,
+                                n_surface_samples=args.surf_samples, z_margin=args.z_margin,
+                                require_inside_frac=args.require_inside_frac
+                            )
+                            if unoccluded_frac < args.unoccluded_thresh:
+                                print("==================OCCLUSION==================")
+                                continue  # Try another random position
+                        
+                        # Found a valid placement!
+                        print(f"[INFO] Main.py fallback placement succeeded after {fallback_attempt + 1} attempts")
+                        break
+                        
+                    except Exception as e:
+                        if fallback_attempt == fallback_tries - 1:  # Last attempt
+                            print(f"[WARN] Main.py fallback placement failed after {fallback_tries} attempts: {e}")
+                        continue
                 # Recompute and print post-safety camera-frame translation
                 M_cam_inv = cam.matrix_world.inverted()
                 t_cam_obj = (M_cam_inv @ obj.matrix_world).to_translation()
@@ -235,12 +265,42 @@ def main():
 
                 print("Sampling mesh surface points for IoU check…")
                 tris_world = _collect_world_triangles(obj_parent)
-                pts_mesh = _sample_points_on_triangles_world(tris_world, args.n_mesh_points)
+                
+                # Adaptive sampling based on object size
+                object_scale = np.linalg.norm(obj_parent.matrix_world.to_scale())
+                adaptive_n_points = int(args.n_mesh_points * object_scale)
+                # Ensure minimum and maximum bounds for sampling
+                adaptive_n_points = max(1000, min(adaptive_n_points, 50000))
+                
+                print(f"[DEBUG] Object scale: {object_scale:.3f}")
+                print(f"[DEBUG] Adaptive sampling points: {adaptive_n_points} (base: {args.n_mesh_points})")
+                
+                pts_mesh = _sample_points_on_triangles_world(tris_world, adaptive_n_points)
 
                 # Build masks and compute IoU BEFORE/AFTER alignment
                 uv_mesh = project_points_distorted(pts_mesh, T_lidar_cam, model, K, D)
                 render_mask = (rgba_raw[..., 3] > 0).astype(np.uint8) * 255
-                pts_mask    = mask_from_points(uv_mesh, width, height, radius=5)
+                
+                # Adaptive radius based on object distance and scale
+                object_distance = np.linalg.norm(obj_parent.matrix_world.translation - cam.matrix_world.translation)
+                base_radius = 5
+                distance_factor = max(0.5, min(2.0, object_distance / 10.0))  # Scale with distance
+                scale_factor = max(0.5, min(2.0, object_scale))  # Scale with object size
+                adaptive_radius = int(base_radius * distance_factor * scale_factor)
+                adaptive_radius = max(1, min(adaptive_radius, 20))  # Reasonable bounds
+                
+                print(f"[DEBUG] Object distance: {object_distance:.3f}m")
+                print(f"[DEBUG] Adaptive mask radius: {adaptive_radius} (base: {base_radius})")
+                
+                pts_mask = mask_from_points(uv_mesh, width, height, radius=adaptive_radius)
+                
+                # Debug projection quality
+                valid_points = np.sum((uv_mesh[:,0] >= 0) & (uv_mesh[:,0] < width) & 
+                                    (uv_mesh[:,1] >= 0) & (uv_mesh[:,1] < height))
+                print(f"[DEBUG] Valid projected points: {valid_points}/{len(uv_mesh)} ({100*valid_points/len(uv_mesh):.1f}%)")
+                print(f"[DEBUG] UV range - U: [{uv_mesh[:,0].min():.1f}, {uv_mesh[:,0].max():.1f}]")
+                print(f"[DEBUG] UV range - V: [{uv_mesh[:,1].min():.1f}, {uv_mesh[:,1].max():.1f}]")
+                
                 iou_before  = compute_iou(render_mask, pts_mask)
 
                 sx, sy, dx, dy = estimate_affine_scale_translate(render_mask, pts_mask)

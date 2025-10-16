@@ -1,6 +1,9 @@
 out/
 out_images/
 out_lidar/
+input/KITTI_dataset/dataset/
+input/KITTI_dataset/KITTI_calibs/
+logs/
 anomaly_injector/__pycache__/
 docker/blender-3.5.0-linux-x64.tar.xz
 docker/blender-3.6.5-linux-x64.tar.xz
