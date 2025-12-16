@@ -13,7 +13,7 @@
 
 ### ------------------- USER CONFIG ------------------- ###
 # Choose dataset: "kitti_sequences" or "stu"
-DATASET="kitti_sequences"  # Change to "stu" for STU dataset
+DATASET="stu"  # Change to "stu" for STU dataset
 
 # KITTI Sequences to process (comma-separated, e.g., "00,01,02" or "00-05" or "all")
 SEQUENCES="${1:-all}"  # Use first argument or default to "all"
@@ -156,11 +156,11 @@ if [[ "$DATASET" == "kitti_sequences" ]]; then
 elif [[ "$DATASET" == "stu" ]]; then
     echo "Using STU dataset configuration"
     CALIB="input/STU_dataset/calib.yaml"
-    IMAGES="../train_images/201/port_a_cam_0"             # input images dir
-    LIDAR="../train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train/201/velodyne"  # input lidar dir
-    LABELS="../train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train/201/labels"   # input labels dir
-    OUT_IMAGES="out/train/201/images"                     # output augmented images
-    OUT_LIDAR="out/train/201/lidar"                       # output augmented lidar
+    IMAGES="/mnt/data2/datasets/STU/train_images/201/port_a_cam_0"             # input images dir
+    LIDAR="/mnt/data2/datasets/STU/train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train/201/velodyne"  # input lidar dir
+    LABELS="/mnt/data2/datasets/STU/train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train/201/labels"   # input labels dir
+    OUT_IMAGES="out/stu/train/201/images"                     # output augmented images
+    OUT_LIDAR="out/stu/train/201/lidar"                       # output augmented lidar
     
     mkdir -p "$OUT_IMAGES" "$OUT_LIDAR"
     
@@ -192,9 +192,9 @@ elif [[ "$DATASET" == "stu" ]]; then
                 --outdir "$tmp_out" \
                 --iou_thresh "$IOU_THRESH" \
                 --iou_max_tries "$IOU_MAX_TRIES" \
-                --x_range 25.0 30.0 \
-                --y_range -10 10 \
-                --place_tries 1000 \
+                --x_range 8.0 10.0 \
+                --y_range -2 2 \
+                --place_tries 3 \
                 --clearance 0.01 \
                 --ground_ransac_thresh 0.5 \
                 --z_margin 0.2 \

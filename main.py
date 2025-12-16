@@ -179,6 +179,7 @@ def main():
                 z_margin=args.z_margin,
                 require_inside_frac=args.require_inside_frac,
                 unoccluded_thresh=args.unoccluded_thresh,
+                lidar_label_path=args.labels,
             )
             # Print camera-frame translation (pre-safety) using the same method as print_relative
             cam = bpy.context.scene.camera

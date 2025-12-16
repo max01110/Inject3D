@@ -15,7 +15,7 @@ def _world_to_blender_cam(p_world, T_lidar_cam):
     R_fix = diag(1,-1,-1).
     """
     R_lc = T_lidar_cam[:3, :3]
-    t_lc = T_lidar_cam[:3, 3]
+    t_lc = T_lidar_cam[:3, 3]  # Camera position in LiDAR/world frame
     R_fix = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
     R_wcam_bl = R_lc @ R_fix                   # world->camera (blender) rotation
     R_blcam_w = R_wcam_bl.T                    # inverse rotation
@@ -25,7 +25,7 @@ def _world_to_blender_cam(p_world, T_lidar_cam):
 def _blender_cam_to_world(p_cam_bl, T_lidar_cam):
     """Convert Blender camera-frame point to world/LiDAR coordinates."""
     R_lc = T_lidar_cam[:3, :3]
-    t_lc = T_lidar_cam[:3, 3]
+    t_lc = T_lidar_cam[:3, 3]  # Camera position in LiDAR/world frame
     R_fix = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
     R_wcam_bl = R_lc @ R_fix
     return R_wcam_bl @ p_cam_bl + t_lc
@@ -34,6 +34,13 @@ def load_lidar_xyz(lidar_bin_path):
     """Return (N,3) XYZ from a KITTI-style lidar.bin (Nx4 float32)."""
     pts = np.fromfile(lidar_bin_path, dtype=np.float32).reshape(-1, 4)
     return pts[:, :3].astype(np.float64)
+
+def load_lidar_labels(lidar_label_path):
+    """Return (N,) labels from a KITTI-style .label file (N uint32)."""
+    return np.fromfile(lidar_label_path, dtype=np.uint32)
+
+# SemanticKITTI-style road/ground labels
+ROAD_LABELS = {40, 44, 48, 49, 60, 72}  # road, parking, sidewalk, other-ground, lane-marking, terrain
 
 def fit_ground_plane_ransac(xyz, dist_thresh=0.15, max_iters=300, seed=None):
     """
@@ -180,6 +187,99 @@ def snap_object_bottom_to_plane(obj_parent, n, d, contact_offset=0.02):
     obj_parent.matrix_world = mw
 
 
+def _build_ground_kdtree(xyz, n, d, ground_thresh=0.15, labels=None, prefer_road=True):
+    """
+    KD-tree of points close to the ground plane.
+    If labels provided and prefer_road=True, prioritize road-labeled points.
+    """
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:
+        return None, None
+
+    dist = np.abs(xyz @ n + d)
+    near_plane_mask = dist <= float(ground_thresh)
+    
+    # If we have labels, prefer road-labeled points
+    if labels is not None and prefer_road:
+        road_mask = np.isin(labels, list(ROAD_LABELS))
+        road_ground_mask = near_plane_mask & road_mask
+        
+        # Use road points if we have enough, otherwise fall back to all ground points
+        if road_ground_mask.sum() >= 100:
+            ground_pts = xyz[road_ground_mask]
+        else:
+            ground_pts = xyz[near_plane_mask]
+    else:
+        ground_pts = xyz[near_plane_mask]
+    
+    if ground_pts.size == 0:
+        return None, ground_pts
+    return cKDTree(ground_pts), ground_pts
+
+
+def _adjust_height_to_ground_points(obj_parent,
+                                    ground_kdtree,
+                                    ground_pts,
+                                    contact_offset=0.02,
+                                    height_margin=0.10,
+                                    k_neighbors=20,
+                                    max_radius=1.5):
+    """
+    Small corrective translation so the object's lowest point touches nearby
+    ground points instead of relying solely on a plane fit.
+    """
+    if ground_kdtree is None or ground_pts is None or ground_pts.size == 0:
+        return
+
+    V = _gather_world_vertices(obj_parent)
+    if V.size == 0:
+        return
+
+    # Use vertices near the bottom face to estimate contact XY
+    z_min = V[:, 2].min()
+    bottom_mask = (V[:, 2] <= z_min + 0.03)  # within 3 cm of the lowest point
+    bottom_pts = V[bottom_mask]
+    if bottom_pts.size == 0:
+        return
+    xy_center = bottom_pts[:, :2].mean(axis=0)
+
+    # Query nearest ground points around that XY
+    query_pt = np.array([xy_center[0], xy_center[1], z_min], dtype=np.float64)
+    dists, idxs = ground_kdtree.query(query_pt, k=k_neighbors, distance_upper_bound=float(max_radius), workers=-1)
+
+    # Handle scipy returning scalars when k=1
+    dists = np.atleast_1d(dists)
+    idxs = np.atleast_1d(idxs)
+
+    valid = idxs < ground_pts.shape[0]
+    if not valid.any():
+        return
+
+    ground_z = np.median(ground_pts[idxs[valid], 2])
+    current_bottom_z = z_min
+    desired_bottom_z = ground_z + float(contact_offset)
+    delta = desired_bottom_z - current_bottom_z
+
+    if abs(delta) < float(height_margin):
+        return  # Already close enough
+
+    mw = obj_parent.matrix_world.copy()
+    mw.translation.z += float(delta)
+    obj_parent.matrix_world = mw
+    
+    # Safety check: ensure object is not below ground after adjustment
+    V_new = _gather_world_vertices(obj_parent)
+    if V_new.size > 0:
+        new_bottom_z = V_new[:, 2].min()
+        if new_bottom_z < ground_z:
+            # Push object up so it sits on ground
+            correction = ground_z + float(contact_offset) - new_bottom_z
+            mw = obj_parent.matrix_world.copy()
+            mw.translation.z += float(correction)
+            obj_parent.matrix_world = mw
+
+
 def _reorient_plane_to_camera(n, d, T_lidar_cam):
     """
     Ensure ground plane is below the camera:
@@ -220,7 +320,9 @@ def place_random_on_lidar_ground(obj_parent,
                                  model=None, K=None, D=None, width=None, height=None,
                                  z_margin=0.05,
                                  require_inside_frac=0.85,
-                                 unoccluded_thresh=1.0):
+                                 unoccluded_thresh=1.0,
+                                 height_margin=0.10,
+                                 lidar_label_path=None):
     if seed is not None:
         rng = np.random.default_rng(seed)
         rand = lambda a, b: float(rng.uniform(a, b))
@@ -229,10 +331,20 @@ def place_random_on_lidar_ground(obj_parent,
 
     # Fit ground and build KD-tree obstacles
     xyz = load_lidar_xyz(lidar_bin_path)
+    labels = None
+    if lidar_label_path is not None:
+        try:
+            labels = load_lidar_labels(lidar_label_path)
+        except Exception:
+            labels = None
+    
     n, d = fit_ground_plane_ransac(xyz, dist_thresh=ransac_thresh, seed=seed)
     if T_lidar_cam is not None:
         n, d = _reorient_plane_to_camera(n, d, T_lidar_cam)
     kdt, _ = build_non_ground_kdtree(xyz, n, d, ground_thresh=ransac_thresh)
+    # Use road-labeled points for ground height adjustment when labels available
+    ground_kdt, ground_pts = _build_ground_kdtree(xyz, n, d, ground_thresh=ransac_thresh, 
+                                                   labels=labels, prefer_road=True)
 
 
     best_pose = None
@@ -249,6 +361,13 @@ def place_random_on_lidar_ground(obj_parent,
         orient_largest_face_to_ground(obj_parent, ground_n_world=n.tolist(),
                                       yaw_range_deg=yaw_range_deg, seed=seed)
         snap_object_bottom_to_plane(obj_parent, n, d, contact_offset=contact_offset)
+        _adjust_height_to_ground_points(
+            obj_parent,
+            ground_kdt,
+            ground_pts,
+            contact_offset=contact_offset,
+            height_margin=height_margin
+        )
 
         # Enforce: object must be below the camera in Blender camera Y (y_cam < 0)
         if T_lidar_cam is not None:

@@ -8,19 +8,20 @@ import cv2
 import numpy as np
 import yaml
 
+# Import calib and proj_ops directly (avoid __init__.py which imports Blender modules)
+import importlib.util
+_pkg_root = Path(__file__).resolve().parents[1] / "anomaly_injector"
 
-def quat_to_R(x, y, z, w):
-    q = np.array([x, y, z, w], dtype=np.float64)
-    nq = q @ q
-    if nq < 1e-12:
-        return np.eye(3, dtype=np.float64)
-    q *= np.sqrt(2.0 / nq)
-    q = np.outer(q, q)
-    return np.array([
-        [1.0 - q[1, 1] - q[2, 2], q[0, 1] - q[2, 3],     q[0, 2] + q[1, 3]],
-        [q[0, 1] + q[2, 3],       1.0 - q[0, 0] - q[2, 2], q[1, 2] - q[0, 3]],
-        [q[0, 2] - q[1, 3],       q[1, 2] + q[0, 3],     1.0 - q[0, 0] - q[1, 1]],
-    ], dtype=np.float64)
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+_calib_mod = _load_module("calib", _pkg_root / "calib.py")
+_proj_mod = _load_module("proj_ops", _pkg_root / "proj_ops.py")
+load_calib = _calib_mod.load_calib
+invert_lidar_cam = _proj_mod.invert_lidar_cam
 
 
 def euler_cam_frame(yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
@@ -34,58 +35,16 @@ def euler_cam_frame(yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
     return Rz @ Ry @ Rx
 
 
-#YAML/Extrinsics 
-
-def _find_static_transform(cfg, desired_child):
-
-    best = exact = camera_like = None
-    for st in cfg.get("static_transforms", []):
-        if st.get("parent") != "os_sensor":
-            continue
-        if st.get("child") == desired_child:
-            exact = st
-            break
-        if camera_like is None and ("camera" in st.get("child", "") or "port_a_camera" in st.get("child", "")):
-            camera_like = st
-        if best is None:
-            best = st
-    return exact or camera_like or best
-
-
 def load_yaml_and_extrinsics(calib_path):
-    with open(calib_path, "r") as f:
-        cfg = yaml.safe_load(f)
-
-    intr = cfg["camera_intrinsics"]
-    model = intr["distortion_model"].lower()
-    if model not in ("plumb_bob", "radtan", "equidistant", "fisheye"):
-        raise ValueError(
-            f"Unsupported distortion_model: {intr['distortion_model']} "
-            f"(use 'plumb_bob'/'radtan' or 'equidistant'/'fisheye')."
-        )
-
-    K = np.array(intr["K"], dtype=np.float64).reshape(3, 3)
-    D = np.array(intr["D"], dtype=np.float64).reshape(-1, 1)
-    P = np.array(intr["P"], dtype=np.float64).reshape(3, 4) if intr.get("P") is not None else None
-    R_rect = np.array(intr["R"], dtype=np.float64).reshape(3, 3) if intr.get("R") is not None else np.eye(3)
-
-    width, height = int(intr["width"]), int(intr["height"])
-    frame_id = intr.get("frame_id", "")
-
-    st = _find_static_transform(cfg, frame_id)
-    if st is None:
-        raise ValueError("Could not find a static transform with parent='os_sensor'.")
-    if st.get("child") != frame_id:
-        print(
-            f"[WARN] static_transforms child '{st.get('child')}' != intrinsics frame_id '{frame_id}'. "
-            f"Proceeding with '{st.get('child')}' extrinsics."
-        )
-
-    t, q = st["translation"], st["rotation"]
-    R_lc = quat_to_R(float(q["x"]), float(q["y"]), float(q["z"]), float(q["w"]))
-    t_lc = np.array([float(t["x"]), float(t["y"]), float(t["z"])], dtype=np.float64)
-
-    R_cl, t_cl = R_lc.T, -R_lc.T @ t_lc
+    """
+    Wrapper that reuses the same calibration + extrinsics logic as the main
+    injection pipeline (`anomaly_injector.calib.load_calib` and
+    `anomaly_injector.proj_ops.invert_lidar_cam`), so projections here match
+    the IoU check in `main.py`.
+    """
+    model, K, D, width, height, T_lidar_cam, P = load_calib(calib_path)
+    R_cl, t_cl = invert_lidar_cam(T_lidar_cam)
+    R_rect = np.eye(3, dtype=np.float64)
 
     return {
         "model": model,
@@ -280,6 +239,10 @@ def main():
 
 
     uv, used = project_plumb_bob(pts_c, K, D), "plumb_bob (radtan)"
+
+    # Filter out invalid projections (NaN, inf, or out of bounds)
+    valid_uv = np.isfinite(uv).all(axis=1)
+    uv, labels = uv[valid_uv], labels[valid_uv]
 
     #optional background
     bg = cv2.imread(args.image, cv2.IMREAD_COLOR) if args.image else None

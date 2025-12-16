@@ -80,6 +80,7 @@ def set_camera_from_extrinsics(K, width, height, T_lidar_cam):
     R_fix = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
     R_world_cam_blender = R_lidar_cam @ R_fix
 
+    # t_lidar_cam IS the camera position in LiDAR/world frame (from ROS static_transform convention)
     T_world_cam = np.eye(4)
     T_world_cam[:3,:3] = R_world_cam_blender
     T_world_cam[:3, 3] = t_lidar_cam
