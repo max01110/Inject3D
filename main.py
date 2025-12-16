@@ -82,17 +82,23 @@ def main():
     parser.add_argument("--ground_contact_offset", type=float, default=0.02) #offset above the ground plane to place the object
     parser.add_argument("--yaw_min", type=float, default=0.0) #minimum yaw angle for object placement
     parser.add_argument("--yaw_max", type=float, default=0.0) #maximum yaw angle for object placement
-    parser.add_argument("--clearance", type=float, default=0.20) #minimum clearance from other points in the lidar point cloud to insert the object
-    parser.add_argument("--place_tries", type=int, default=1) #number of attempts to place the object without collisions 
+    parser.add_argument("--clearance", type=float, default=0.30) #minimum clearance from other points in the lidar point cloud to insert the object
+    parser.add_argument("--place_tries", type=int, default=150) #number of attempts to place the object without collisions (distributed across expanding bounds stages) 
     parser.add_argument("--surf_samples", type=int, default=40000) #number of surface points (from objaverse object) to sample for collision & occlusion checking
     parser.add_argument("--z_margin", type=float, default=0.05) #margin for z-buffer occlusion checking (the object’s depth being at least z_margin closer than the scene depth)
     parser.add_argument("--require_inside_frac", type=float, default=0.85) #fraction of object points that must be inside the image
     parser.add_argument("--unoccluded_thresh", type=float, default=1.0) #fraction of object points that must be unoccluded in the z-buffer
-
+    
+    # Manual placement (overrides random placement)
+    parser.add_argument("--manual_x", type=float, default=None, help="Manual X coordinate (LiDAR frame)")
+    parser.add_argument("--manual_y", type=float, default=None, help="Manual Y coordinate (LiDAR frame)")
+    parser.add_argument("--manual_z", type=float, default=None, help="Manual Z coordinate (LiDAR frame, optional if --manual_adjust_to_ground)")
+    parser.add_argument("--manual_yaw", type=float, default=0.0, help="Manual yaw rotation in degrees")
+    parser.add_argument("--manual_adjust_to_ground", action="store_true", help="Adjust Z to ground height (requires --manual_x and --manual_y)")
 
     # Sizing
     parser.add_argument("--target_size", type=float, default=None,
-                        help="If set, use this longest-side size (m) instead of random [0.5,2.2]")
+                        help="If set, use this longest-side size (m) instead of random [0.2,0.9]")
     parser.add_argument("--size_jitter_frac", type=float, default=0.15)
 
     # IoU control
@@ -154,81 +160,68 @@ def main():
             # Import & size
             obj_parent = import_mesh(mesh_path)
             triangulate_and_smooth(obj_parent)
-            target_size = args.target_size if args.target_size is not None else random.uniform(0.5, 2.2)
+            target_size = args.target_size if args.target_size is not None else random.uniform(0.2, 0.9)
             fit_object_longest_to(obj_parent, target_size=target_size, jitter_frac=args.size_jitter_frac)
       
-            # Placement on LiDAR ground
-            assert args.x_range[0] < args.x_range[1]
-            assert args.y_range[0] < args.y_range[1]
-            assert args.yaw_min <= args.yaw_max
-            place_random_on_lidar_ground(
-                obj_parent,
-                lidar_bin_path=args.lidar,
-                x_range=tuple(args.x_range),
-                y_range=tuple(args.y_range),
-                seed=args.seed,
-                ransac_thresh=args.ground_ransac_thresh,
-                contact_offset=args.ground_contact_offset,
-                yaw_range_deg=(args.yaw_min, args.yaw_max),
-                clearance=args.clearance,
-                tries=args.place_tries,
-                n_surface_samples=args.surf_samples,
-                avoid_occlusion=True,
-                zbuf=zbuf,
-                T_lidar_cam=T_lidar_cam, model=model, K=K, D=D, width=width, height=height,
-                z_margin=args.z_margin,
-                require_inside_frac=args.require_inside_frac,
-                unoccluded_thresh=args.unoccluded_thresh,
-                lidar_label_path=args.labels,
-            )
-            # Print camera-frame translation (pre-safety) using the same method as print_relative
+            # Check if manual placement is requested
+            if args.manual_x is not None and args.manual_y is not None:
+                # Manual placement - skip all checks
+                from anomaly_injector.placement import place_manual
+                placement_success = place_manual(
+                    obj_parent,
+                    x=args.manual_x,
+                    y=args.manual_y,
+                    z=args.manual_z,
+                    yaw_deg=args.manual_yaw,
+                    lidar_bin_path=args.lidar if args.manual_adjust_to_ground else None,
+                    adjust_to_ground=args.manual_adjust_to_ground,
+                    ransac_thresh=args.ground_ransac_thresh,
+                    contact_offset=args.ground_contact_offset,
+                    lidar_label_path=args.labels if args.manual_adjust_to_ground else None,
+                )
+            else:
+                # Random placement on LiDAR ground with STRICT collision/occlusion checks
+                assert args.x_range[0] < args.x_range[1]
+                assert args.y_range[0] < args.y_range[1]
+                assert args.yaw_min <= args.yaw_max
+                placement_success = place_random_on_lidar_ground(
+                    obj_parent,
+                    lidar_bin_path=args.lidar,
+                    x_range=tuple(args.x_range),
+                    y_range=tuple(args.y_range),
+                    seed=args.seed,
+                    ransac_thresh=args.ground_ransac_thresh,
+                    contact_offset=args.ground_contact_offset,
+                    yaw_range_deg=(args.yaw_min, args.yaw_max),
+                    clearance=args.clearance,
+                    tries=args.place_tries,
+                    n_surface_samples=args.surf_samples,
+                    avoid_occlusion=True,
+                    zbuf=zbuf,
+                    T_lidar_cam=T_lidar_cam, model=model, K=K, D=D, width=width, height=height,
+                    z_margin=args.z_margin,
+                    require_inside_frac=args.require_inside_frac,
+                    unoccluded_thresh=args.unoccluded_thresh,
+                    lidar_label_path=args.labels,
+                    allow_expand_bounds=True,
+                    max_y_expand=2.0,
+                    max_x_expand=4.0,
+                    require_on_road=True,
+                    road_max_distance=1.0,
+                )
+            
+            # If placement failed, skip this object and try another
+            if not placement_success:
+                print(f"[SKIP] No valid placement found for this object - trying a different object")
+                _delete_object_hierarchy(obj_parent)
+                continue
+            
+            # Print camera-frame translation for debugging
             cam = bpy.context.scene.camera
             obj = bpy.data.objects.get("ObjaverseAsset") or obj_parent
             M_cam_inv = cam.matrix_world.inverted()
             t_cam_obj = (M_cam_inv @ obj.matrix_world).to_translation()
-            print(f"[DEBUG] Before safety: cam-frame translation = ({t_cam_obj.x:.3f}, {t_cam_obj.y:.3f}, {t_cam_obj.z:.3f})")
-            # Final safety: if object ends up above the camera (y_cam >= 0), try multiple random placements
-            if t_cam_obj.y >= -0.4:
-                print("[WARN] Object above camera after placement; trying random camera-relative locations.")
-                fallback_tries = 50
-                for fallback_attempt in range(fallback_tries):
-                    try:
-                        # Set directly to a random Blender camera-frame location within x_range (no snap/orient)
-                        random_z = random.uniform(args.x_range[0], args.x_range[1])
-                        random_y = random.uniform(args.y_range[0], args.y_range[1])
-                        p_c = Vector((random_y, -1.65, -random_z))
-                        p_w = cam.matrix_world @ p_c
-                        mw_fb = obj.matrix_world.copy()
-                        mw_fb.translation = Vector((float(p_w.x), float(p_w.y), float(p_w.z)))
-                        obj.matrix_world = mw_fb
-                        
-                        # Check collision with scene
-                        if has_collision_with_scene(obj, kdt, clearance=args.clearance, n_samples=args.surf_samples):
-                            continue  # Try another random position
-                        
-                        # Check occlusion if zbuf is available
-                        if zbuf is not None:
-                            inside_frac, unoccluded_frac = fraction_unoccluded(
-                                obj, zbuf, T_lidar_cam, model, K, D, width, height,
-                                n_surface_samples=args.surf_samples, z_margin=args.z_margin,
-                                require_inside_frac=args.require_inside_frac
-                            )
-                            if unoccluded_frac < args.unoccluded_thresh:
-                                print("==================OCCLUSION==================")
-                                continue  # Try another random position
-                        
-                        # Found a valid placement!
-                        print(f"[INFO] Main.py fallback placement succeeded after {fallback_attempt + 1} attempts")
-                        break
-                        
-                    except Exception as e:
-                        if fallback_attempt == fallback_tries - 1:  # Last attempt
-                            print(f"[WARN] Main.py fallback placement failed after {fallback_tries} attempts: {e}")
-                        continue
-                # Recompute and print post-safety camera-frame translation
-                M_cam_inv = cam.matrix_world.inverted()
-                t_cam_obj = (M_cam_inv @ obj.matrix_world).to_translation()
-                print(f"[DEBUG] After safety: cam-frame translation = ({t_cam_obj.x:.3f}, {t_cam_obj.y:.3f}, {t_cam_obj.z:.3f})")
+            print(f"[DEBUG] Placement: cam-frame translation = ({t_cam_obj.x:.3f}, {t_cam_obj.y:.3f}, {t_cam_obj.z:.3f})")
 
             # Optional: verify ground plane orientation — ensure it's below camera
             xyz_lidar = load_lidar_xyz(args.lidar)
@@ -267,13 +260,22 @@ def main():
                 print("Sampling mesh surface points for IoU check…")
                 tris_world = _collect_world_triangles(obj_parent)
                 
-                # Adaptive sampling based on object size
+                # Calculate object distance from camera (needed for adaptive sampling and radius)
+                object_distance = np.linalg.norm(obj_parent.matrix_world.translation - cam.matrix_world.translation)
+                
+                # Adaptive sampling based on object size AND distance
+                # Closer objects cover more pixels and need more sampled points
                 object_scale = np.linalg.norm(obj_parent.matrix_world.to_scale())
-                adaptive_n_points = int(args.n_mesh_points * object_scale)
+                # Calculate apparent size factor: closer objects need more points
+                # At 5m: factor ~2.0, at 10m: factor ~1.0, at 20m: factor ~0.5
+                apparent_size_factor = max(0.5, min(3.0, 10.0 / max(object_distance, 1.0)))
+                adaptive_n_points = int(args.n_mesh_points * object_scale * apparent_size_factor)
                 # Ensure minimum and maximum bounds for sampling
-                adaptive_n_points = max(1000, min(adaptive_n_points, 50000))
+                adaptive_n_points = max(2000, min(adaptive_n_points, 80000))
                 
                 print(f"[DEBUG] Object scale: {object_scale:.3f}")
+                print(f"[DEBUG] Object distance: {object_distance:.3f}m")
+                print(f"[DEBUG] Apparent size factor: {apparent_size_factor:.3f}")
                 print(f"[DEBUG] Adaptive sampling points: {adaptive_n_points} (base: {args.n_mesh_points})")
                 
                 pts_mesh = _sample_points_on_triangles_world(tris_world, adaptive_n_points)
@@ -283,14 +285,16 @@ def main():
                 render_mask = (rgba_raw[..., 3] > 0).astype(np.uint8) * 255
                 
                 # Adaptive radius based on object distance and scale
-                object_distance = np.linalg.norm(obj_parent.matrix_world.translation - cam.matrix_world.translation)
-                base_radius = 5
-                distance_factor = max(0.5, min(2.0, object_distance / 10.0))  # Scale with distance
-                scale_factor = max(0.5, min(2.0, object_scale))  # Scale with object size
+                # Closer objects appear larger in pixels, so projected points are more spread out
+                # We need LARGER radius for closer objects to fill gaps between points
+                base_radius = 3
+                # Inverse relationship: closer objects need larger radius
+                # At 5m: factor ~2.0, at 10m: factor ~1.0, at 20m: factor ~0.5
+                distance_factor = max(0.5, min(2.5, 10.0 / max(object_distance, 1.0)))
+                scale_factor = max(0.5, min(1.5, object_scale))  # Scale with object size
                 adaptive_radius = int(base_radius * distance_factor * scale_factor)
-                adaptive_radius = max(1, min(adaptive_radius, 20))  # Reasonable bounds
+                adaptive_radius = max(2, min(adaptive_radius, 15))  # Reasonable bounds
                 
-                print(f"[DEBUG] Object distance: {object_distance:.3f}m")
                 print(f"[DEBUG] Adaptive mask radius: {adaptive_radius} (base: {base_radius})")
                 
                 pts_mask = mask_from_points(uv_mesh, width, height, radius=adaptive_radius)

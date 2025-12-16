@@ -39,8 +39,8 @@ def load_lidar_labels(lidar_label_path):
     """Return (N,) labels from a KITTI-style .label file (N uint32)."""
     return np.fromfile(lidar_label_path, dtype=np.uint32)
 
-# SemanticKITTI-style road/ground labels
-ROAD_LABELS = {40, 44, 48, 49, 60, 72}  # road, parking, sidewalk, other-ground, lane-marking, terrain
+# SemanticKITTI-style road label (strict - only actual road surface)
+ROAD_LABELS = {40}  # road only
 
 def fit_ground_plane_ransac(xyz, dist_thresh=0.15, max_iters=300, seed=None):
     """
@@ -218,6 +218,53 @@ def _build_ground_kdtree(xyz, n, d, ground_thresh=0.15, labels=None, prefer_road
     return cKDTree(ground_pts), ground_pts
 
 
+def _build_road_only_kdtree(xyz, labels):
+    """
+    Build a KD-tree containing ONLY road-labeled points (no fallback).
+    Returns (kdtree, road_pts) or (None, None) if no road points.
+    """
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:
+        return None, None
+    
+    if labels is None:
+        return None, None
+    
+    road_mask = np.isin(labels, list(ROAD_LABELS))
+    road_pts = xyz[road_mask]
+    
+    if road_pts.size == 0:
+        return None, None
+    
+    return cKDTree(road_pts), road_pts
+
+
+def _is_on_road(x, y, road_kdtree, road_pts, max_distance=1.5):
+    """
+    Check if position (x, y) is within max_distance of a road point.
+    Returns True if on or near road, False otherwise.
+    """
+    if road_kdtree is None or road_pts is None:
+        return True  # If no road data, allow placement (fallback behavior)
+    
+    # Query using XY only (ignore Z for this check)
+    # Find nearest road point in 2D
+    query_pt = np.array([x, y, 0.0], dtype=np.float64)
+    
+    # Get nearby road points
+    dist, idx = road_kdtree.query(query_pt, k=1)
+    
+    if idx >= road_pts.shape[0]:
+        return False
+    
+    # Check 2D distance (XY only)
+    road_pt = road_pts[idx]
+    dist_2d = np.sqrt((x - road_pt[0])**2 + (y - road_pt[1])**2)
+    
+    return dist_2d <= max_distance
+
+
 def _adjust_height_to_ground_points(obj_parent,
                                     ground_kdtree,
                                     ground_pts,
@@ -322,7 +369,25 @@ def place_random_on_lidar_ground(obj_parent,
                                  require_inside_frac=0.85,
                                  unoccluded_thresh=1.0,
                                  height_margin=0.10,
-                                 lidar_label_path=None):
+                                 lidar_label_path=None,
+                                 allow_expand_bounds=True,
+                                 max_y_expand=2.0,
+                                 max_x_expand=4.0,
+                                 require_on_road=True,
+                                 road_max_distance=1.0):
+    """
+    Place object on LiDAR ground with strict collision and occlusion checks.
+    
+    Returns True if placement succeeded, False if no valid placement found.
+    When placement fails, the object is NOT placed in a bad location - caller
+    should skip this frame.
+    
+    Multi-stage placement:
+    1. Try with original bounds
+    2. If difficult, gradually expand horizontal (y) bounds
+    3. If still failing, expand distance (x) bounds
+    4. Return False if no valid placement after all attempts
+    """
     if seed is not None:
         rng = np.random.default_rng(seed)
         rand = lambda a, b: float(rng.uniform(a, b))
@@ -341,119 +406,244 @@ def place_random_on_lidar_ground(obj_parent,
     n, d = fit_ground_plane_ransac(xyz, dist_thresh=ransac_thresh, seed=seed)
     if T_lidar_cam is not None:
         n, d = _reorient_plane_to_camera(n, d, T_lidar_cam)
-    kdt, _ = build_non_ground_kdtree(xyz, n, d, ground_thresh=ransac_thresh)
+    # Use a SMALL threshold for collision KD-tree to include obstacle points near ground
+    # (e.g., car wheels, pedestrian feet, pole bases)
+    collision_ground_thresh = min(0.10, ransac_thresh)  # Max 10cm from ground excluded
+    kdt, _ = build_non_ground_kdtree(xyz, n, d, ground_thresh=collision_ground_thresh)
     # Use road-labeled points for ground height adjustment when labels available
     ground_kdt, ground_pts = _build_ground_kdtree(xyz, n, d, ground_thresh=ransac_thresh, 
                                                    labels=labels, prefer_road=True)
+    # Build road-only KD-tree for strict road placement check
+    road_kdt, road_pts = _build_road_only_kdtree(xyz, labels)
+    # Only enforce road placement if requested AND we have road labels
+    enforce_road = require_on_road and (road_kdt is not None)
 
-
+    # Multi-stage placement with expanding bounds for difficult frames
+    # Stage 0: original bounds
+    # Stage 1: expand y by 50%
+    # Stage 2: expand y by 100% (max_y_expand)
+    # Stage 3: also expand x range
+    stages = [(x_range, y_range)]  # Stage 0: original
+    
+    if allow_expand_bounds:
+        # Stage 1: expand y by 50%
+        y_expand_1 = max_y_expand * 0.5
+        stages.append((
+            x_range,
+            (y_range[0] - y_expand_1, y_range[1] + y_expand_1)
+        ))
+        # Stage 2: expand y fully
+        stages.append((
+            x_range,
+            (y_range[0] - max_y_expand, y_range[1] + max_y_expand)
+        ))
+        # Stage 3: also expand x (push objects further out)
+        stages.append((
+            (x_range[0], x_range[1] + max_x_expand),
+            (y_range[0] - max_y_expand, y_range[1] + max_y_expand)
+        ))
+    
+    # Distribute tries across stages (more tries for earlier stages)
+    tries_per_stage = []
+    remaining = int(tries)
+    for i, _ in enumerate(stages):
+        # Earlier stages get more tries
+        stage_tries = max(10, remaining // (len(stages) - i))
+        tries_per_stage.append(stage_tries)
+        remaining -= stage_tries
+    
     best_pose = None
-    for _ in range(int(tries)):
-        # Propose XY on ground
-        x = rand(*x_range); y = rand(*y_range)
-        z = z_on_plane_at_xy(n, d, x, y, fallback_z=np.percentile(xyz[:,2], 5))
+    rejection_stats = {'camera_pos': 0, 'collision': 0, 'outside_fov': 0, 'occluded': 0, 'not_on_road': 0}
+    
+    for stage_idx, (curr_x_range, curr_y_range) in enumerate(stages):
+        stage_tries = tries_per_stage[stage_idx]
+        
+        for _ in range(stage_tries):
+            # Propose XY on ground
+            x = rand(*curr_x_range)
+            y = rand(*curr_y_range)
+            
+            # ROAD CHECK: Ensure placement is on road (early rejection to save computation)
+            if enforce_road and not _is_on_road(x, y, road_kdt, road_pts, max_distance=road_max_distance):
+                rejection_stats['not_on_road'] += 1
+                continue
+            
+            z = z_on_plane_at_xy(n, d, x, y, fallback_z=np.percentile(xyz[:,2], 5))
 
-        # Place & orient
-        mw = obj_parent.matrix_world.copy()
-        mw.translation = Vector((x, y, z))
-        obj_parent.matrix_world = mw
+            # Place & orient
+            mw = obj_parent.matrix_world.copy()
+            mw.translation = Vector((x, y, z))
+            obj_parent.matrix_world = mw
 
-        orient_largest_face_to_ground(obj_parent, ground_n_world=n.tolist(),
-                                      yaw_range_deg=yaw_range_deg, seed=seed)
-        snap_object_bottom_to_plane(obj_parent, n, d, contact_offset=contact_offset)
-        _adjust_height_to_ground_points(
-            obj_parent,
-            ground_kdt,
-            ground_pts,
-            contact_offset=contact_offset,
-            height_margin=height_margin
-        )
-
-        # Enforce: object must be below the camera in Blender camera Y (y_cam < 0)
-        if T_lidar_cam is not None:
-            try:
-                p_world = np.array(list(obj_parent.matrix_world.translation), dtype=np.float64)
-                p_cam_bl = _world_to_blender_cam(p_world, T_lidar_cam)
-                if not (p_cam_bl[1] < 0.0):
-                    # Reject this sample if it's not below the camera
-                    continue
-            except Exception:
-                pass
-
-        # Collision check vs scene
-        if has_collision_with_scene(obj_parent, kdt, clearance=clearance, n_samples=n_surface_samples):
-            continue
-
-        #Occlusion rejection
-        if avoid_occlusion:
-            # Use fewer samples for a faster visibility test
-            fast_samples = int(min(max(800, 0.25 * n_surface_samples), 3000))
-            inside_frac, unocc_frac = fraction_unoccluded(
-                obj_parent, zbuf, T_lidar_cam, model, K, D, width, height,
-                n_surface_samples=fast_samples,
-                z_margin=z_margin,
-                require_inside_frac=require_inside_frac
+            orient_largest_face_to_ground(obj_parent, ground_n_world=n.tolist(),
+                                          yaw_range_deg=yaw_range_deg, seed=seed)
+            snap_object_bottom_to_plane(obj_parent, n, d, contact_offset=contact_offset)
+            _adjust_height_to_ground_points(
+                obj_parent,
+                ground_kdt,
+                ground_pts,
+                contact_offset=contact_offset,
+                height_margin=height_margin
             )
-            # Optional refine if borderline (disabled by default for speed)
-            # if inside_frac >= require_inside_frac and (unocc_frac < unoccluded_thresh + 0.05):
-            #     inside_frac, unocc_frac = fraction_unoccluded(
-            #         obj_parent, zbuf, T_lidar_cam, model, K, D, width, height,
-            #         n_surface_samples=min(n_surface_samples, 6000),
-            #         z_margin=z_margin,
-            #         require_inside_frac=require_inside_frac
-            #     )
-            # Require enough of the object to be actually visible,
-            # and all visible samples to be unoccluded (or above threshold)
-            if inside_frac < require_inside_frac:
-                continue
-            if unocc_frac < unoccluded_thresh:
+
+            # Enforce: object must be below the camera in Blender camera Y (y_cam < 0)
+            if T_lidar_cam is not None:
+                try:
+                    p_world = np.array(list(obj_parent.matrix_world.translation), dtype=np.float64)
+                    p_cam_bl = _world_to_blender_cam(p_world, T_lidar_cam)
+                    if not (p_cam_bl[1] < 0.0):
+                        rejection_stats['camera_pos'] += 1
+                        continue
+                except Exception:
+                    pass
+
+            # STRICT collision check - use more samples for accuracy
+            collision_samples = max(n_surface_samples, 3000)
+            if has_collision_with_scene(obj_parent, kdt, clearance=clearance, n_samples=collision_samples):
+                rejection_stats['collision'] += 1
                 continue
 
-        best_pose = obj_parent.matrix_world.copy()
-        break
+            # STRICT occlusion rejection
+            if avoid_occlusion:
+                # Use more samples for stricter occlusion check
+                occ_samples = max(1500, int(0.4 * n_surface_samples))
+                inside_frac, unocc_frac = fraction_unoccluded(
+                    obj_parent, zbuf, T_lidar_cam, model, K, D, width, height,
+                    n_surface_samples=occ_samples,
+                    z_margin=z_margin,
+                    require_inside_frac=require_inside_frac
+                )
+                
+                # Strict visibility requirements
+                if inside_frac < require_inside_frac:
+                    rejection_stats['outside_fov'] += 1
+                    continue
+                if unocc_frac < unoccluded_thresh:
+                    rejection_stats['occluded'] += 1
+                    continue
 
+            # Valid placement found!
+            best_pose = obj_parent.matrix_world.copy()
+            if stage_idx > 0:
+                print(f"[INFO] Placement succeeded with expanded bounds (stage {stage_idx}): "
+                      f"x={curr_x_range}, y={curr_y_range}")
+            break
+        
+        if best_pose is not None:
+            break
+    
     if best_pose is None:
-        print(f"[WARN] Could not find a valid placement in {tries} tries. Applying manual fallback placement in front of and below the camera.")
+        # NO FALLBACK - reject this frame entirely
+        total_rejected = sum(rejection_stats.values())
+        print(f"[REJECT] Could not find valid placement after {tries} tries across {len(stages)} stages.")
+        print(f"  Rejection breakdown: not_on_road={rejection_stats['not_on_road']}, "
+              f"camera_pos={rejection_stats['camera_pos']}, collision={rejection_stats['collision']}, "
+              f"outside_fov={rejection_stats['outside_fov']}, occluded={rejection_stats['occluded']}")
+        return False
+    
+    obj_parent.matrix_world = best_pose
+    return True
 
-        # Manual fallback: place at a fixed Blender-camera-relative location (no snap/orient)
-        # Blender camera convention: looking along -Z, X right, Y up. We want Y<0 and Z<0.
-        if T_lidar_cam is not None:
+
+def place_manual(obj_parent,
+                x, y, z=None,
+                yaw_deg=0.0,
+                lidar_bin_path=None,
+                adjust_to_ground=False,
+                ransac_thresh=0.15,
+                contact_offset=0.02,
+                height_margin=0.10,
+                lidar_label_path=None):
+    """
+    Manually place object at exact coordinates, skipping all placement checks.
+    
+    Args:
+        obj_parent: Blender object to place
+        x, y: X and Y coordinates in LiDAR/world frame (required)
+        z: Z coordinate in LiDAR/world frame. If None and adjust_to_ground=True,
+           will be automatically adjusted to ground height
+        yaw_deg: Yaw rotation in degrees (default: 0.0)
+        lidar_bin_path: Path to LiDAR .bin file (required if adjust_to_ground=True)
+        adjust_to_ground: If True, adjust Z to ground height (default: False)
+        ransac_thresh: RANSAC threshold for ground fitting (if adjusting to ground)
+        contact_offset: Offset from ground for object contact point
+        height_margin: Margin for height adjustment
+        lidar_label_path: Path to label file (optional, for road-aware ground adjustment)
+    
+    Returns:
+        True if placement succeeded, False otherwise
+    """
+    import bpy
+    from mathutils import Euler
+    
+    # Set rotation (yaw around Z axis)
+    yaw_rad = math.radians(yaw_deg)
+    obj_parent.rotation_euler = Euler((0.0, 0.0, yaw_rad), 'XYZ')
+    
+    # Set position
+    if z is None and adjust_to_ground:
+        if lidar_bin_path is None:
+            print("[ERROR] lidar_bin_path required when adjust_to_ground=True and z=None")
+            return False
+        
+        # Load LiDAR and fit ground
+        xyz = load_lidar_xyz(lidar_bin_path)
+        
+        # Fit ground plane
+        n, d = fit_ground_plane_ransac(xyz, dist_thresh=ransac_thresh, seed=None)
+        
+        # Adjust height to ground at (x, y)
+        labels = None
+        if lidar_label_path:
             try:
-                # Desired point in camera frame (meters) - random distance within x_range
-                random_z = random.uniform(x_range[0], x_range[1])
-                p_c_bl = np.array([0.0, -2.0, -random_z], dtype=np.float64)
-                # Transform to LiDAR/world frame using Blender camera convention
-                p_l = _blender_cam_to_world(p_c_bl, T_lidar_cam)
-                # Directly set world translation
-                mw_fb = obj_parent.matrix_world.copy()
-                mw_fb.translation = Vector((float(p_l[0]), float(p_l[1]), float(p_l[2])))
-                obj_parent.matrix_world = mw_fb
-
-                best_pose = obj_parent.matrix_world.copy()
-            except Exception as e:
-                print(f"[WARN] Manual fallback placement failed: {e}. Keeping last pose.")
-                best_pose = None
-        else:
-            print("[WARN] No T_lidar_cam provided; cannot compute camera-relative fallback.")
-            best_pose = None
-    else:
-        obj_parent.matrix_world = best_pose
-
-        # Final validation: ensure below camera (y_cam < 0). If not, override with manual fallback.
-        if T_lidar_cam is not None:
-            try:
-                p_world = np.array(list(obj_parent.matrix_world.translation), dtype=np.float64)
-                p_cam_bl = _world_to_blender_cam(p_world, T_lidar_cam)
-                if not (p_cam_bl[1] < 0.0):
-                    # Directly set a random camera-relative position within x_range
-                    random_z = random.uniform(x_range[0], x_range[1])
-                    p_c_bl = np.array([0.0, -2.0, -random_z], dtype=np.float64)
-                    p_l = _blender_cam_to_world(p_c_bl, T_lidar_cam)
-                    mw_fb = obj_parent.matrix_world.copy()
-                    mw_fb.translation = Vector((float(p_l[0]), float(p_l[1]), float(p_l[2])))
-                    obj_parent.matrix_world = mw_fb
+                labels = load_lidar_labels(lidar_label_path)
             except Exception:
                 pass
-
+        
+        # Build ground KD-tree for height adjustment
+        ground_kdt, ground_pts = _build_ground_kdtree(xyz, n, d, ground_thresh=ransac_thresh,
+                                                      labels=labels, prefer_road=True)
+        
+        if ground_kdt is not None and ground_pts.shape[0] > 0:
+            # Find nearest ground point to (x, y)
+            query_xy = np.array([[x, y]], dtype=np.float64)
+            dists, indices = ground_kdt.query(query_xy, k=min(5, len(ground_pts)), workers=-1)
+            if isinstance(dists, np.ndarray) and dists.size > 0:
+                if dists.ndim == 1:
+                    nearest_idx = indices[0] if isinstance(indices, np.ndarray) else indices
+                    ground_z = float(ground_pts[nearest_idx, 2])
+                else:
+                    nearest_idx = indices[0, 0] if isinstance(indices, np.ndarray) else indices[0]
+                    ground_z = float(ground_pts[nearest_idx, 2])
+            else:
+                # Fallback: use plane equation
+                ground_z = float(-(n[0] * x + n[1] * y + d) / n[2]) if abs(n[2]) > 1e-6 else 0.0
+        else:
+            # Fallback: use plane equation
+            ground_z = float(-(n[0] * x + n[1] * y + d) / n[2]) if abs(n[2]) > 1e-6 else 0.0
+        
+        # Get object's lowest point
+        V = _gather_world_vertices(obj_parent)
+        if V.size > 0:
+            # Temporarily place at (x, y, 0) to get object bounds
+            obj_parent.location = (x, y, 0.0)
+            bpy.context.view_layer.update()
+            V_temp = _gather_world_vertices(obj_parent)
+            obj_bottom_z = float(V_temp[:, 2].min())
+            
+            # Calculate z so object bottom touches ground
+            z = ground_z + float(contact_offset) - obj_bottom_z
+        else:
+            z = ground_z + float(contact_offset)
+    
+    elif z is None:
+        z = 0.0  # Default to z=0 if not specified and not adjusting to ground
+    
+    # Set final position
+    obj_parent.location = (x, y, z)
+    bpy.context.view_layer.update()
+    
+    print(f"[MANUAL PLACEMENT] Object placed at ({x:.3f}, {y:.3f}, {z:.3f}), yaw={yaw_deg:.1f}°")
+    return True
 
 
