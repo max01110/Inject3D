@@ -11,13 +11,17 @@
 #       ./augment_dataset.sh "00-05"            # Process range of sequences
 #       ./augment_dataset.sh "all"              # Process all sequences (explicit)
 #
-#   STU: ./augment_dataset.sh --dataset stu --base_dir BASE_DIR --sequence SEQUENCE [--lidar_subpath SUBPATH]
+#   STU: ./augment_dataset.sh --dataset stu --base_dir BASE_DIR --sequence SEQUENCE [--lidar_subpath SUBPATH] [--start_frame N] [--frames FRAMES]
 #     The script will auto-detect common STU path structures. If your structure differs,
 #     use --lidar_subpath to specify the subpath to the sequence directory.
+#     Use --start_frame to skip frames before a certain number (useful when early frames lack full labeling).
+#     Use --frames to process only specific frames (comma-separated, ranges supported).
 #     Examples:
 #       ./augment_dataset.sh --dataset stu --base_dir /mnt/data2/datasets/STU --sequence 201
 #       ./augment_dataset.sh --dataset stu --base_dir /path/to/stu --sequence 202
 #       ./augment_dataset.sh --dataset stu --base_dir /path/to/stu --sequence 201 --lidar_subpath "train"
+#       ./augment_dataset.sh --dataset stu --base_dir /path/to/stu --sequence 201 --start_frame 50
+#       ./augment_dataset.sh --dataset stu --base_dir /path/to/stu --sequence 201 --frames "1,3,5,10-15,45"
 #
 #   Manual Placement (works with both KITTI and STU):
 #     Set MANUAL_X and MANUAL_Y in USER CONFIG section, or use command-line:
@@ -27,7 +31,7 @@
 #                            --manual_x 10.0 --manual_y 1.0 --manual_adjust_to_ground
 
 # ./augment_dataset.sh --dataset stu --base_dir /mnt/data2/datasets/STU --sequence 201 --lidar_subpath "train_pointcloud/nodes/dom/work/nekrasov/data/stu_dataset/train"
-# ./augment_dataset.sh --dataset stu --base_dir /mnt/data2/datasets/STU --sequence 201 --lidar_subpath "val_pointcloud"
+# ./augment_dataset.sh --dataset stu --base_dir /mnt/data2/datasets/STU --sequence 201 --lidar_subpath "val_pointcloud" --start_frame 100
 
 ### ------------------- USER CONFIG ------------------- ###
 # Choose dataset: "kitti_sequences" or "stu"
@@ -37,9 +41,9 @@ DATASET="kitti_sequences"
 # Manual placement settings (set to enable manual placement, leave empty for automatic)
 # When manual_x and manual_y are set, object will be placed at exact coordinates
 # and all collision/occlusion checks will be skipped
-MANUAL_X="6.5"      # X coordinate in LiDAR frame (e.g., "10.0")
-MANUAL_Y="0.5"      # Y coordinate in LiDAR frame (e.g., "1.0")
-MANUAL_Z="-1.5"      # Z coordinate (optional, leave empty to auto-adjust to ground)
+MANUAL_X=""      # X coordinate in LiDAR frame (e.g., "10.0")
+MANUAL_Y=""      # Y coordinate in LiDAR frame (e.g., "1.0")
+MANUAL_Z=""      # Z coordinate (optional, leave empty to auto-adjust to ground)
 MANUAL_YAW=""    # Yaw rotation in degrees (default: "0.0")
 MANUAL_ADJUST_TO_GROUND="1"  # Set to "1" to auto-adjust Z to ground height
 
@@ -48,6 +52,8 @@ STU_BASE_DIR=""
 STU_SEQUENCE=""
 STU_LIDAR_SUBPATH=""
 KITTI_SEQUENCES="all"
+START_FRAME=0  # Start processing from this frame number (skip earlier frames)
+SPECIFIC_FRAMES=""  # Process only these specific frames (comma-separated, ranges supported)
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -86,6 +92,14 @@ while [[ $# -gt 0 ]]; do
         --manual_adjust_to_ground)
             MANUAL_ADJUST_TO_GROUND="1"
             shift
+            ;;
+        --start_frame)
+            START_FRAME="$2"
+            shift 2
+            ;;
+        --frames)
+            SPECIFIC_FRAMES="$2"
+            shift 2
             ;;
         *)
             # For backward compatibility, treat first positional arg as KITTI sequences
@@ -132,6 +146,10 @@ else
     echo "[INFO] Automatic placement enabled"
 fi
 
+if [[ "$START_FRAME" -gt 0 ]]; then
+    echo "[INFO] Starting from frame $START_FRAME (skipping earlier frames)"
+fi
+
 # Common settings
 SCRIPT="main.py"
 PER_PAIR=1                                 # number of augmentations per pair
@@ -167,6 +185,64 @@ parse_sequences() {
     
     echo "${sequences[@]}"
 }
+
+# Function to parse frames input (handles "1,3,5,10-15,45" format)
+# Returns space-separated list of frame numbers
+parse_frames() {
+    local input="$1"
+    local frames=()
+    
+    # Remove all spaces from input
+    input=$(echo "$input" | tr -d ' ')
+    
+    # Split by comma
+    IFS=',' read -ra parts <<< "$input"
+    for part in "${parts[@]}"; do
+        if [[ "$part" =~ ^[0-9]+-[0-9]+$ ]]; then
+            # Handle range format like "10-15"
+            local start=$(echo "$part" | cut -d'-' -f1)
+            local end=$(echo "$part" | cut -d'-' -f2)
+            for ((i=start; i<=end; i++)); do
+                frames+=("$i")
+            done
+        else
+            # Single number
+            frames+=("$part")
+        fi
+    done
+    
+    echo "${frames[@]}"
+}
+
+# Declare associative array for frame lookup (populated later if --frames is used)
+declare -A FRAMES_TO_PROCESS
+
+# Function to check if a frame number should be processed
+should_process_frame() {
+    local frame_num="$1"
+    
+    # If no specific frames specified, process all (subject to START_FRAME)
+    if [[ -z "$SPECIFIC_FRAMES" ]]; then
+        return 0  # true, process this frame
+    fi
+    
+    # Check if frame is in the associative array
+    if [[ -v FRAMES_TO_PROCESS[$frame_num] ]]; then
+        return 0  # true, process this frame
+    fi
+    
+    return 1  # false, skip this frame
+}
+
+# Populate FRAMES_TO_PROCESS if --frames was specified
+if [[ -n "$SPECIFIC_FRAMES" ]]; then
+    echo "[INFO] Processing only specific frames: $SPECIFIC_FRAMES"
+    FRAME_LIST=($(parse_frames "$SPECIFIC_FRAMES"))
+    for f in "${FRAME_LIST[@]}"; do
+        FRAMES_TO_PROCESS[$f]=1
+    done
+    echo "[INFO] Total frames to process: ${#FRAME_LIST[@]}"
+fi
 
 # KITTI Sequences Configuration
 if [[ "$DATASET" == "kitti_sequences" ]]; then
@@ -207,8 +283,20 @@ if [[ "$DATASET" == "kitti_sequences" ]]; then
                 continue
             fi
             
-            echo "Processing: $img_path"
             stem=$(basename "$img_path" .png)
+            
+            # Extract frame number and skip if before START_FRAME
+            frame_num=$((10#$stem))  # Convert to decimal (handles leading zeros)
+            if [[ "$frame_num" -lt "$START_FRAME" ]]; then
+                continue
+            fi
+            
+            # Skip if specific frames are requested and this frame is not in the list
+            if ! should_process_frame "$frame_num"; then
+                continue
+            fi
+            
+            echo "Processing: $img_path"
             lidar_path="$LIDAR/$stem.bin"
             label_path="$LABELS/$stem.label"
             
@@ -412,8 +500,20 @@ elif [[ "$DATASET" == "stu" ]]; then
     mkdir -p "$OUT_IMAGES" "$OUT_LIDAR"
     
     for img_path in "$IMAGES"/*.png; do
-        echo $img_path
         stem=$(basename "$img_path" .png)
+        
+        # Extract frame number and skip if before START_FRAME
+        frame_num=$((10#$stem))  # Convert to decimal (handles leading zeros)
+        if [[ "$frame_num" -lt "$START_FRAME" ]]; then
+            continue
+        fi
+        
+        # Skip if specific frames are requested and this frame is not in the list
+        if ! should_process_frame "$frame_num"; then
+            continue
+        fi
+        
+        echo "Processing: $img_path"
         lidar_path="$LIDAR/$stem.bin"
         label_path="$LABELS/$stem.label"
 
@@ -440,15 +540,15 @@ elif [[ "$DATASET" == "stu" ]]; then
                 --iou_thresh "$IOU_THRESH" \
                 --iou_max_tries "$IOU_MAX_TRIES" \
                 $MANUAL_PLACEMENT_ARGS \
-                --x_range 8.0 10.5 \
+                --x_range 5.5 12.0 \
                 --y_range -2 2 \
-                --place_tries 150 \
-                --clearance 0.25 \
+                --place_tries 100 \
+                --clearance 0.0 \
                 --ground_ransac_thresh 0.15 \
                 --z_margin 0.2 \
-                --require_inside_frac 0.7 \
-                --unoccluded_thresh 0.90 \
-                --surf_samples 10000 \
+                --require_inside_frac 0.5 \
+                --unoccluded_thresh 0.50 \
+                --surf_samples 5000 \
                 --fast
 
             # Move outputs to final destinations with unique names

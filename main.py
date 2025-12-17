@@ -79,7 +79,7 @@ def main():
     parser.add_argument("--x_range", nargs=2, type=float, metavar=("XMIN","XMAX"), default=(4.0, 12.0)) #distance range in front of the lidar to place the object
     parser.add_argument("--y_range", nargs=2, type=float, metavar=("YMIN","YMAX"), default=(-2.0, 2.0)) #lateral range to place the object
     parser.add_argument("--ground_ransac_thresh", type=float, default=0.15) #RANSAC threshold for ground plane fitting -> threshold distance from randomly selected plane (for) to other lidar points (larger num means more robust, but less accurate)
-    parser.add_argument("--ground_contact_offset", type=float, default=0.02) #offset above the ground plane to place the object
+    parser.add_argument("--ground_contact_offset", type=float, default=0.06) #offset above the ground plane to place the object
     parser.add_argument("--yaw_min", type=float, default=0.0) #minimum yaw angle for object placement
     parser.add_argument("--yaw_max", type=float, default=0.0) #maximum yaw angle for object placement
     parser.add_argument("--clearance", type=float, default=0.30) #minimum clearance from other points in the lidar point cloud to insert the object
@@ -160,7 +160,7 @@ def main():
             # Import & size
             obj_parent = import_mesh(mesh_path)
             triangulate_and_smooth(obj_parent)
-            target_size = args.target_size if args.target_size is not None else random.uniform(0.2, 0.9)
+            target_size = args.target_size if args.target_size is not None else random.uniform(0.6, 1.5)
             fit_object_longest_to(obj_parent, target_size=target_size, jitter_frac=args.size_jitter_frac)
       
             # Check if manual placement is requested
@@ -206,8 +206,8 @@ def main():
                     allow_expand_bounds=True,
                     max_y_expand=2.0,
                     max_x_expand=4.0,
-                    require_on_road=True,
-                    road_max_distance=1.0,
+                    require_on_road=False,
+                    road_max_distance=2.0,
                 )
             
             # If placement failed, skip this object and try another

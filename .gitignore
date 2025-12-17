@@ -7,3 +7,7 @@ logs/
 anomaly_injector/__pycache__/
 docker/blender-3.5.0-linux-x64.tar.xz
 docker/blender-3.6.5-linux-x64.tar.xz
+archive/
+merged_dataset/
+merge_frames.sh
+merge_frames_206.sh

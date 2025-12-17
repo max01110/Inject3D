@@ -376,25 +376,27 @@ def place_random_on_lidar_ground(obj_parent,
                                  require_on_road=True,
                                  road_max_distance=1.0):
     """
-    Place object on LiDAR ground with strict collision and occlusion checks.
+    Place object randomly on LiDAR ground within bounds.
+    
+    Simple placement logic (like manual placement but with randomness):
+    1. Pick random x, y within bounds
+    2. Find ground height from nearest LiDAR points (same as MANUAL_ADJUST_TO_GROUND)
+    3. Place object so its bottom sits on top of ground
+    4. Check for collision with scene points
+    5. Check object is visible in camera (not occluded)
     
     Returns True if placement succeeded, False if no valid placement found.
-    When placement fails, the object is NOT placed in a bad location - caller
-    should skip this frame.
-    
-    Multi-stage placement:
-    1. Try with original bounds
-    2. If difficult, gradually expand horizontal (y) bounds
-    3. If still failing, expand distance (x) bounds
-    4. Return False if no valid placement after all attempts
     """
+    import bpy
+    from scipy.spatial import cKDTree
+    
     if seed is not None:
         rng = np.random.default_rng(seed)
         rand = lambda a, b: float(rng.uniform(a, b))
     else:
         rand = lambda a, b: float(random.uniform(a, b))
 
-    # Fit ground and build KD-tree obstacles
+    # Load LiDAR points
     xyz = load_lidar_xyz(lidar_bin_path)
     labels = None
     if lidar_label_path is not None:
@@ -403,142 +405,137 @@ def place_random_on_lidar_ground(obj_parent,
         except Exception:
             labels = None
     
-    n, d = fit_ground_plane_ransac(xyz, dist_thresh=ransac_thresh, seed=seed)
-    if T_lidar_cam is not None:
-        n, d = _reorient_plane_to_camera(n, d, T_lidar_cam)
-    # Use a SMALL threshold for collision KD-tree to include obstacle points near ground
-    # (e.g., car wheels, pedestrian feet, pole bases)
-    collision_ground_thresh = min(0.10, ransac_thresh)  # Max 10cm from ground excluded
-    kdt, _ = build_non_ground_kdtree(xyz, n, d, ground_thresh=collision_ground_thresh)
-    # Use road-labeled points for ground height adjustment when labels available
-    ground_kdt, ground_pts = _build_ground_kdtree(xyz, n, d, ground_thresh=ransac_thresh, 
-                                                   labels=labels, prefer_road=True)
-    # Build road-only KD-tree for strict road placement check
-    road_kdt, road_pts = _build_road_only_kdtree(xyz, labels)
-    # Only enforce road placement if requested AND we have road labels
-    enforce_road = require_on_road and (road_kdt is not None)
+    # Build KD-tree of ALL points for ground height queries (same as manual placement)
+    # Prefer road-labeled points if available, otherwise use lowest points
+    if labels is not None:
+        road_mask = np.isin(labels, list(ROAD_LABELS))
+        if road_mask.sum() >= 100:
+            ground_pts = xyz[road_mask]
+        else:
+            # Use lowest 20% of points as ground
+            z_thresh = np.percentile(xyz[:, 2], 20)
+            ground_pts = xyz[xyz[:, 2] <= z_thresh]
+    else:
+        # Use lowest 20% of points as ground
+        z_thresh = np.percentile(xyz[:, 2], 20)
+        ground_pts = xyz[xyz[:, 2] <= z_thresh]
+    
+    if ground_pts.shape[0] < 10:
+        ground_pts = xyz  # Fallback to all points
+    
+    ground_kdt = cKDTree(ground_pts)
+    
+    # Build KD-tree for collision detection (non-ground points)
+    # Simple approach: points above the 30th percentile Z are obstacles
+    z_obstacle_thresh = np.percentile(xyz[:, 2], 30)
+    obstacle_pts = xyz[xyz[:, 2] > z_obstacle_thresh]
+    obstacle_kdt = cKDTree(obstacle_pts) if obstacle_pts.shape[0] > 0 else None
 
-    # Multi-stage placement with expanding bounds for difficult frames
-    # Stage 0: original bounds
-    # Stage 1: expand y by 50%
-    # Stage 2: expand y by 100% (max_y_expand)
-    # Stage 3: also expand x range
-    stages = [(x_range, y_range)]  # Stage 0: original
-    
-    if allow_expand_bounds:
-        # Stage 1: expand y by 50%
-        y_expand_1 = max_y_expand * 0.5
-        stages.append((
-            x_range,
-            (y_range[0] - y_expand_1, y_range[1] + y_expand_1)
-        ))
-        # Stage 2: expand y fully
-        stages.append((
-            x_range,
-            (y_range[0] - max_y_expand, y_range[1] + max_y_expand)
-        ))
-        # Stage 3: also expand x (push objects further out)
-        stages.append((
-            (x_range[0], x_range[1] + max_x_expand),
-            (y_range[0] - max_y_expand, y_range[1] + max_y_expand)
-        ))
-    
-    # Distribute tries across stages (more tries for earlier stages)
-    tries_per_stage = []
-    remaining = int(tries)
-    for i, _ in enumerate(stages):
-        # Earlier stages get more tries
-        stage_tries = max(10, remaining // (len(stages) - i))
-        tries_per_stage.append(stage_tries)
-        remaining -= stage_tries
-    
     best_pose = None
-    rejection_stats = {'camera_pos': 0, 'collision': 0, 'outside_fov': 0, 'occluded': 0, 'not_on_road': 0}
+    rejection_stats = {'collision': 0, 'outside_fov': 0, 'occluded': 0, 'no_ground': 0}
     
-    for stage_idx, (curr_x_range, curr_y_range) in enumerate(stages):
-        stage_tries = tries_per_stage[stage_idx]
+    print(f"[PLACEMENT] Starting random placement search (tries={tries}, x_range={x_range}, y_range={y_range})")
+    print(f"[PLACEMENT] Ground points: {ground_pts.shape[0]}, Obstacle points: {obstacle_pts.shape[0] if obstacle_pts is not None else 0}")
+    
+    for attempt in range(tries):
+        # Pick random x, y within bounds
+        x = rand(*x_range)
+        y = rand(*y_range)
         
-        for _ in range(stage_tries):
-            # Propose XY on ground
-            x = rand(*curr_x_range)
-            y = rand(*curr_y_range)
-            
-            # ROAD CHECK: Ensure placement is on road (early rejection to save computation)
-            if enforce_road and not _is_on_road(x, y, road_kdt, road_pts, max_distance=road_max_distance):
-                rejection_stats['not_on_road'] += 1
-                continue
-            
-            z = z_on_plane_at_xy(n, d, x, y, fallback_z=np.percentile(xyz[:,2], 5))
+        # Find ground height at (x, y) by querying nearest ground points (same as manual placement)
+        query_pt = np.array([x, y, 0.0], dtype=np.float64)
+        dists, indices = ground_kdt.query(query_pt, k=min(10, ground_pts.shape[0]))
+        
+        # Handle scipy returning scalars
+        dists = np.atleast_1d(dists)
+        indices = np.atleast_1d(indices)
+        
+        # Filter to nearby points (within 5m horizontal distance - more lenient)
+        valid_mask = dists < 5.0
+        if not valid_mask.any():
+            rejection_stats['no_ground'] += 1
+            continue
+        
+        # Get ground Z from nearest points (use median for robustness)
+        nearby_z = ground_pts[indices[valid_mask], 2]
+        ground_z = float(np.median(nearby_z))
+        
+        # Place object temporarily at (x, y, 0) to measure its size
+        obj_parent.location = (x, y, 0.0)
+        obj_parent.rotation_euler = (0.0, 0.0, rand(math.radians(yaw_range_deg[0]), math.radians(yaw_range_deg[1])))
+        bpy.context.view_layer.update()
+        
+        # Get object's bottom Z
+        V = _gather_world_vertices(obj_parent)
+        if V.size == 0:
+            continue
+        obj_bottom_z = float(V[:, 2].min())
+        
+        # Calculate final Z so object bottom sits ON TOP of ground (with small offset)
+        final_z = ground_z + contact_offset - obj_bottom_z
+        
+        # Set final position
+        obj_parent.location = (x, y, final_z)
+        bpy.context.view_layer.update()
+        
+        # Verify object is above ground (safety check)
+        V_final = _gather_world_vertices(obj_parent)
+        if V_final.size > 0:
+            final_bottom = float(V_final[:, 2].min())
+            if final_bottom < ground_z:
+                # Push up to ensure on top
+                correction = ground_z + contact_offset - final_bottom
+                obj_parent.location = (x, y, final_z + correction)
+                bpy.context.view_layer.update()
 
-            # Place & orient
-            mw = obj_parent.matrix_world.copy()
-            mw.translation = Vector((x, y, z))
-            obj_parent.matrix_world = mw
-
-            orient_largest_face_to_ground(obj_parent, ground_n_world=n.tolist(),
-                                          yaw_range_deg=yaw_range_deg, seed=seed)
-            snap_object_bottom_to_plane(obj_parent, n, d, contact_offset=contact_offset)
-            _adjust_height_to_ground_points(
-                obj_parent,
-                ground_kdt,
-                ground_pts,
-                contact_offset=contact_offset,
-                height_margin=height_margin
-            )
-
-            # Enforce: object must be below the camera in Blender camera Y (y_cam < 0)
-            if T_lidar_cam is not None:
-                try:
-                    p_world = np.array(list(obj_parent.matrix_world.translation), dtype=np.float64)
-                    p_cam_bl = _world_to_blender_cam(p_world, T_lidar_cam)
-                    if not (p_cam_bl[1] < 0.0):
-                        rejection_stats['camera_pos'] += 1
-                        continue
-                except Exception:
-                    pass
-
-            # STRICT collision check - use more samples for accuracy
-            collision_samples = max(n_surface_samples, 3000)
-            if has_collision_with_scene(obj_parent, kdt, clearance=clearance, n_samples=collision_samples):
+        # Check 1: No collision with obstacle points (relaxed check)
+        # Only reject if there are MANY points very close to the object center
+        if obstacle_kdt is not None and clearance > 0:
+            obj_center = np.array([x, y, ground_z + 0.5], dtype=np.float64)
+            # Use a smaller radius (just the clearance, not clearance + 1.0)
+            nearby_obstacles = obstacle_kdt.query_ball_point(obj_center, r=clearance)
+            # Only reject if there are obstacle points VERY close (within clearance)
+            if len(nearby_obstacles) > 200:  # Much more lenient threshold
                 rejection_stats['collision'] += 1
                 continue
 
-            # STRICT occlusion rejection
-            if avoid_occlusion:
-                # Use more samples for stricter occlusion check
-                occ_samples = max(1500, int(0.4 * n_surface_samples))
-                inside_frac, unocc_frac = fraction_unoccluded(
-                    obj_parent, zbuf, T_lidar_cam, model, K, D, width, height,
-                    n_surface_samples=occ_samples,
-                    z_margin=z_margin,
-                    require_inside_frac=require_inside_frac
-                )
-                
-                # Strict visibility requirements
-                if inside_frac < require_inside_frac:
-                    rejection_stats['outside_fov'] += 1
-                    continue
-                if unocc_frac < unoccluded_thresh:
-                    rejection_stats['occluded'] += 1
-                    continue
+        # Check 2: Object is visible (not occluded, inside FOV)
+        if avoid_occlusion:
+            inside_frac, unocc_frac = fraction_unoccluded(
+                obj_parent, zbuf, T_lidar_cam, model, K, D, width, height,
+                n_surface_samples=min(1500, n_surface_samples),
+                z_margin=z_margin,
+                require_inside_frac=require_inside_frac
+            )
+            
+            if inside_frac < require_inside_frac:
+                rejection_stats['outside_fov'] += 1
+                if (attempt + 1) % 25 == 0:
+                    print(f"[PLACEMENT] Attempt {attempt+1}/{tries} - Stats: collision={rejection_stats['collision']}, "
+                          f"fov={rejection_stats['outside_fov']}, occluded={rejection_stats['occluded']}, "
+                          f"no_ground={rejection_stats['no_ground']}")
+                continue
+            if unocc_frac < unoccluded_thresh:
+                rejection_stats['occluded'] += 1
+                if (attempt + 1) % 25 == 0:
+                    print(f"[PLACEMENT] Attempt {attempt+1}/{tries} - Stats: collision={rejection_stats['collision']}, "
+                          f"fov={rejection_stats['outside_fov']}, occluded={rejection_stats['occluded']}, "
+                          f"no_ground={rejection_stats['no_ground']}")
+                continue
 
-            # Valid placement found!
-            best_pose = obj_parent.matrix_world.copy()
-            if stage_idx > 0:
-                print(f"[INFO] Placement succeeded with expanded bounds (stage {stage_idx}): "
-                      f"x={curr_x_range}, y={curr_y_range}")
-            break
-        
-        if best_pose is not None:
-            break
+        # Valid placement found!
+        best_pose = obj_parent.matrix_world.copy()
+        print(f"[PLACEMENT] Success at x={x:.2f}, y={y:.2f}, ground_z={ground_z:.2f} (attempt {attempt+1}/{tries})")
+        print(f"[PLACEMENT] Rejection breakdown: collision={rejection_stats['collision']}, "
+              f"outside_fov={rejection_stats['outside_fov']}, occluded={rejection_stats['occluded']}, "
+              f"no_ground={rejection_stats['no_ground']}")
+        break
     
     if best_pose is None:
-        # NO FALLBACK - reject this frame entirely
-        total_rejected = sum(rejection_stats.values())
-        print(f"[REJECT] Could not find valid placement after {tries} tries across {len(stages)} stages.")
-        print(f"  Rejection breakdown: not_on_road={rejection_stats['not_on_road']}, "
-              f"camera_pos={rejection_stats['camera_pos']}, collision={rejection_stats['collision']}, "
-              f"outside_fov={rejection_stats['outside_fov']}, occluded={rejection_stats['occluded']}")
+        print(f"[REJECT] Could not find valid placement after {tries} tries.")
+        print(f"  Rejection breakdown: collision={rejection_stats['collision']}, "
+              f"outside_fov={rejection_stats['outside_fov']}, occluded={rejection_stats['occluded']}, "
+              f"no_ground={rejection_stats['no_ground']}")
         return False
     
     obj_parent.matrix_world = best_pose
