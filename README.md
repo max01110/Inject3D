@@ -1,234 +1,247 @@
 # Inject3D
-This repository provides a data generation pipeline to expand a dataset with lidar and image pairs with random objects in geometrically and spatially consistent locations
 
-The pipeline is designed for anomaly/data augmentation experiments in autonomous driving, robotics, and 3D vision research.
+A data augmentation pipeline for LiDAR + camera datasets. Injects random 3D objects from Objaverse into scenes in a geometrically consistent way.
 
-Note: This data augmentation is not perfect. Please double-check any generated results before using them for training or evaluation.
+Useful for anomaly detection, data augmentation, and 3D vision research in autonomous driving and robotics.
 
-![alt text](https://github.com/max01110/Inject3D/blob/main/assets/demo.png "Demo images")
+**Note:** Generated results should be manually verified before use in training or evaluation.
 
-
-# How Inject3D Works
-
-Inject3D takes a LiDAR point cloud + camera image pair and augments them with a random 3D object in a physically consistent way:
-
-**1. Calibration loading**
-
-Reads a YAML file with camera intrinsics (K, distortion, P) and extrinsics (T<sub>LiDAR→Cam</sub>).
-
-Supports just pinhole (plumb_bob) camera models for now.
-
-**2. Scene preparation (Blender)**
-
-- Starts a clean Blender scene.
-
-- Sets up a virtual camera matching the real sensor intrinsics/extrinsics.
-
-- Imports a random 3D mesh from Objaverse  and scales it to a random defined range.
-
-**3. Ground-aware placement**
-
-- Fits a ground plane to the LiDAR cloud using RANSAC.
-
-- Samples a random (x, y) in front of the ego-vehicle.
-
-- Computes z from the ground plane → snaps the object’s lowest point to the ground.
-
-- Orients the object so its largest face lies flat on the ground, then applies a random yaw.
-
-**4. Collision + occlusion checks**
-
-- Builds a KD-tree of non-ground LiDAR points to reject placements that intersect existing obstacles (--clearance).
-
-- Builds a LiDAR-derived z-buffer in camera space to ensure the object is fully visible (no occlusion).
-
-**5. Rendering & compositing**
-
-- Renders the object with transparent background in Blender.
-
-- Warps the render from rectified → distorted image domain (using OpenCV, this is not perfect and is corrected later).
-
-- Alpha-composites the object over the original camera frame.
-
-**6. Point cloud augmentation**
-
-- Samples points from the object’s mesh surface.
-
-- Appends them to the original .bin LiDAR cloud.
-
-- Writes new .bin + .label files with injected points marked as --anomaly_label.
-
-**7. IoU Check/Alignment**
-
-Given that the blender composite can't fully replicate the camera model, we perform a final alignment/check
-
-- Project augmented point cloud on camera frame
-- Check IoU of point cloud object and composite
-- Align composite such that it maximizes IoU
-- If final IoU < threshold, reject and restart
-
-In practice, we find that using an IoU threshold of 0.92 provides a good balance — it yields results that are nearly perfect while avoiding excessive retries. Achieving a true 100% IoU is unrealistic given the inherent differences between LiDAR point clouds and image-based renderings, so 0.92 serves as a practical compromise. However, feel free to experiment and adapt this as needed.
-
-**Outputs**
-
-- Augmented image (aug_image_distorted.png).
-
-- Augmented point cloud (aug_lidar.bin).
-
-- Augmented labels (aug_lidar.label).
+![Demo](https://github.com/max01110/Inject3D/blob/main/assets/demo.png)
 
 
-**Disclaimer:** This tool is useful for generating 2D–3D consistent training data (e.g., for voxel-based experiments), but the augmented results are not guaranteed to be perfectly reliable. All generated outputs should be double-checked before use in downstream tasks.
+## How It Works
 
-# 1. Installation
+### Pipeline Overview
 
+1. **Load calibration** — Camera intrinsics (K, distortion) and LiDAR-to-camera extrinsics from YAML
+2. **Setup Blender scene** — Virtual camera matching real sensor parameters
+3. **Import 3D object** — Random mesh from Objaverse, scaled to realistic size
+4. **Place on ground** — RANSAC ground plane fitting, snap object to surface
+5. **Collision/occlusion checks** — Reject placements that intersect obstacles or are hidden
+6. **Render & composite** — Blender render with distortion correction, alpha composite onto image
+7. **Augment point cloud** — Sample points from mesh surface, append to LiDAR with anomaly label
+8. **IoU verification** — Align render to projected points, reject if IoU < threshold
 
-Clone the repository
+### Object Placement
 
-```bash
-git clone https://github.com/max01110/Inject3D.git
-cd Inject3D
-```
+The placement algorithm has two modes:
 
-## 1.1 Local Install
+**Automatic placement:**
+1. Fit ground plane to LiDAR points using RANSAC
+2. Sample random (x, y) position within configured bounds
+3. Query nearby ground points to get local height
+4. Place object so its bottom sits on the ground surface
+5. Apply random yaw rotation
+6. Check for collisions with existing obstacles (KD-tree query)
+7. Verify object is visible in camera (not occluded, inside FOV)
+8. Retry with different position if checks fail
 
-1. Install Blender from [here](https://www.blender.org/download/)
+**Manual placement:**
+- Specify exact (x, y) coordinates in LiDAR frame
+- Optionally set z manually or auto-adjust to ground height
+- Skips collision/occlusion checks (useful for debugging or specific placements)
 
-	a) Use Blender version > 2.9 (we recommend 3.6.5)
+### Key Parameters
 
+| Parameter | Description |
+|-----------|-------------|
+| `--x_range` | Distance range in front of sensor (meters) |
+| `--y_range` | Lateral range (meters) |
+| `--clearance` | Minimum distance from existing obstacles |
+| `--place_tries` | Attempts before giving up on placement |
+| `--require_inside_frac` | Fraction of object that must be in camera FOV |
+| `--unoccluded_thresh` | Fraction that must be visible (not behind obstacles) |
+| `--iou_thresh` | Required IoU between render and projected points |
 
-	b) untar the downloaded zip folder and make note of the path to the Blender folder, the folder structure will look like this:
-	```
-	./blender-3.6.5-linux-x64
-	├── blender
-	├── 3.6
-    ...
-	```
-	where `blender` is the executable used to run Blender, and `3.6` is the blender version which contains Blender's Python environment
+### Outputs
 
-	c) Install Blender using apt to install dependencies
-	```
-	apt install blender
-	```
-
-2. install requirements 
-
-	a) general requirements can be installed with:
-	```
-	pip install -r requirements.txt
-	```
-	b). install blender requirements inside the Blender Python environment by running:
-    ```
-    /blender-3.6.5-linux-x64/3.6/python/bin/python3.10 -m pip install -r requirement_bpy.txt
-    ```
-
-## 1.2 Docker
-
-1. Install Blender from [here](https://www.blender.org/download/)
-
-	a) Use Blender version > 2.9 (we recommend 3.6.5)
-
-    b) Place the .tar file in the ```Docker/``` folder
-
-    b) In the ```Dockerfile``` adapt the version of the downloaded blender
-
-2. Build docker container 
-    ```
-    cd docker
-    sudo docker build --build-arg USERNAME=$USER -t inject3d:latest .
-    ```
+- `aug_image.png` — Composited image with injected object
+- `aug_lidar.bin` — Point cloud with object points appended
+- `aug_lidar.label` — Labels with object points marked (default label: 150)
 
 
-# 2. Setup
+## Installation
 
-## 2.1. Calibration Files
+### Local Setup
 
-The camera intrinsics and camera-from-LiDAR extrinsics are provided in a single YAML:
+1. **Install Blender** (version 3.6.5 recommended)
+   ```bash
+   # Download from https://www.blender.org/download/
+   # Also install via apt for dependencies:
+   apt install blender
+   ```
+
+2. **Install Python packages**
+   ```bash
+   pip install -r requirements.txt
+   
+   # Inside Blender's Python environment:
+   /path/to/blender-3.6.5-linux-x64/3.6/python/bin/python3.10 -m pip install -r requirement_bpy.txt
+   ```
+
+### Docker
+
+1. Download Blender .tar and place in `docker/`
+2. Update Blender version in `Dockerfile`
+3. Build:
+   ```bash
+   cd docker
+   docker build --build-arg USERNAME=$USER -t inject3d:latest .
+   ```
+
+
+## Calibration
+
+Camera intrinsics and extrinsics in a single YAML file:
 
 ```yaml
 camera_intrinsics:
-  frame_id: port_a_cam_0
   width: 1920
   height: 1200
-  distortion_model: plumb_bob      # or: equidistant (fisheye)
-  K: [fx, 0, cx, 0, fy, cy, 0, 0, 1]   # 3x3 row-major
-  D: [k1, k2, p1, p2, k3]              # radtan (plumb_bob)
-  # For fisheye/equidistant use [k1, k2, k3, k4]
-  P: [fxp, 0, cxp, 0, 0, fyp, cyp, 0, 0, 0, 1, 0]  # 3x4 row-major
+  distortion_model: plumb_bob  # or: equidistant
+  K: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+  D: [k1, k2, p1, p2, k3]
+  P: [fxp, 0, cxp, 0, 0, fyp, cyp, 0, 0, 0, 1, 0]
 
-# Extrinsics: camera w.r.t. LiDAR/world ("os_sensor")
 static_transforms:
   - parent: os_sensor
-    child: port_a_cam_0
-    translation: {x: tx, y: ty, z: tz}      # meters
-    rotation:    {x: qx, y: qy, z: qz, w: qw} # unit quaternion
+    child: camera_frame
+    translation: {x: tx, y: ty, z: tz}
+    rotation: {x: qx, y: qy, z: qz, w: qw}
 ```
 
-An example of the calibration file format can be found in ```input/STU_dataset/calib.yaml```
+See `input/STU_dataset/calib.yaml` for a complete example.
 
-**Frame convention:**
-LiDAR/world frame used: +X forward, +Y left, +Z up.
-
-Extrinsics above define T_LiDAR→Cam (camera pose in LiDAR/world).
-
-distortion_model supports plumb_bob (a.k.a. radtan) and equidistant (fisheye).
+**Coordinate convention:** LiDAR frame is +X forward, +Y left, +Z up.
 
 
-## 2.2 Point Cloud & Image Pair
+## Usage
 
-**LiDAR point cloud (.bin):** KITTI-style N×4 float32 with columns [x, y, z, r] in LiDAR frame (we only use x,y,z)
-
-**Labels (.label):** N × uint32 semantic class IDs aligned 1:1 with the .bin.
-
-The pipeline appends new points for the injected mesh and labels them with --anomaly_label (default 150).
-
-**Image:** The raw distorted RGB frame corresponding to the LiDAR sweep (PNG/JPG).
-
-# 3. Usage
-For a list of possible arguments to customize and adapt your augmented dataset, please see ```main.py```
-
-## 3.1 Local
+### Single Frame
 
 ```bash
-BLENDER=/path/to/blender
-
-$BLENDER -b --python main.py -- --calib input/STU_dataset/calib.yaml --image input/STU_dataset/000000.png --lidar input/STU_dataset/000000.bin --labels input/STU_dataset/000000.label     --outdir out/000000
+blender -b -P main.py -- \
+    --calib input/STU_dataset/calib.yaml \
+    --image input/STU_dataset/000000.png \
+    --lidar input/STU_dataset/000000.bin \
+    --labels input/STU_dataset/000000.label \
+    --outdir out/000000
 ```
 
+### Batch Processing
 
-## 3.2 Docker
+The `augment_dataset.sh` script processes entire sequences.
 
-```bash
-docker run --gpus all --rm -it -v $(pwd):/workspace inject3d:latest bash -lc 
-
-cd /workspace
-
-blender -b --python main.py -- --calib input/STU_dataset/calib.yaml --image input/STU_dataset/000000.png --lidar input/STU_dataset/000000.bin --labels input/STU_dataset/000000.label     --outdir out/000000
-```
-
-# 4 Extra Tools
-
-## 4.1 Point Cloud Projection on Camera
-We provide a script to project the lidar points onto the camera frame as a check to ensure the augmented object is inserted properly.
-
-To use this script run:
+#### KITTI Dataset
 
 ```bash
-python scripts/project_lidar_on_cam.py --label out/000000.png/aug_lidar.label --calib input/STU_dataset/calib.yaml --out projection.png --image input/STU_dataset/000000.png 
-```
-
-Please refer to the script for more info on specific optional arugments you can pass in
-
-
-## 4.2 Dataset Augment
-
-We also provid a script to augment a directory of image-lidar pairs.
-
-Configure your settings inside the bash script ```scripts/augment_dataset.sh``
-
-Then, run:
-
-```bash
-chmod +x scripts/augment_dataset.sh
+# All sequences (00-21)
 ./augment_dataset.sh
+
+# Specific sequences
+./augment_dataset.sh "00,01,02"
+
+# Range of sequences
+./augment_dataset.sh "00-05"
+```
+
+Default paths:
+- Input: `/mnt/data1/datasets/kitti_odom/dataset/sequences/`
+- Output: `/mnt/data1/datasets/augmented_kitti_odom/`
+- Calibration: `input/KITTI_dataset/KITTI_calibs/calib_XX.yaml`
+
+#### STU Dataset
+
+```bash
+./augment_dataset.sh --dataset stu --base_dir /path/to/stu --sequence 201
+```
+
+The script auto-detects common STU directory structures. If needed, specify the path explicitly:
+
+```bash
+./augment_dataset.sh --dataset stu --base_dir /path/to/stu --sequence 201 \
+    --lidar_subpath "train_pointcloud"
+```
+
+#### Frame Selection
+
+```bash
+# Start from a specific frame
+./augment_dataset.sh --dataset stu --base_dir /path --sequence 201 --start_frame 50
+
+# Process only specific frames
+./augment_dataset.sh --dataset stu --base_dir /path --sequence 201 --frames "1,3,5,10-15,45"
+```
+
+#### Manual Object Placement
+
+Override automatic placement with exact coordinates:
+
+```bash
+# Specify position (auto-adjust height to ground)
+./augment_dataset.sh --dataset stu --base_dir /path --sequence 201 \
+    --manual_x 10.0 --manual_y 1.0 --manual_adjust_to_ground
+
+# Full manual control
+./augment_dataset.sh --dataset stu --base_dir /path --sequence 201 \
+    --manual_x 10.0 --manual_y 1.0 --manual_z 0.5 --manual_yaw 45
+```
+
+### Docker Usage
+
+```bash
+docker run --gpus all --rm -it -v $(pwd):/workspace inject3d:latest bash -lc "
+    cd /workspace
+    blender -b -P main.py -- --calib input/STU_dataset/calib.yaml ...
+"
+```
+
+
+## Extra Tools
+
+### Point Cloud Projection
+
+Visualize LiDAR points projected onto the camera image:
+
+```bash
+python scripts/project_lidar_on_cam.py \
+    --lidar out/000000/aug_lidar.bin \
+    --label out/000000/aug_lidar.label \
+    --calib input/STU_dataset/calib.yaml \
+    --image input/STU_dataset/000000.png \
+    --out projection.png
+```
+
+
+## main.py Arguments
+
+Run `blender -b -P main.py -- --help` for the full list. Key parameters:
+
+```
+Required:
+  --calib       Calibration YAML file
+  --image       Input image (distorted)
+  --lidar       Input point cloud (.bin)
+  --labels      Input labels (.label)
+  --outdir      Output directory
+
+Placement:
+  --x_range     Forward distance range [min max] (default: 4.0 12.0)
+  --y_range     Lateral range [min max] (default: -2.0 2.0)
+  --clearance   Min distance from obstacles (default: 0.30)
+  --place_tries Placement attempts (default: 150)
+
+Manual placement:
+  --manual_x, --manual_y    Exact position in LiDAR frame
+  --manual_z                Exact height (optional)
+  --manual_yaw              Rotation in degrees
+  --manual_adjust_to_ground Auto-adjust Z to ground
+
+Quality:
+  --iou_thresh      Required IoU (default: 0.92)
+  --iou_max_tries   Retries if IoU fails (default: 10)
+
+Object sizing:
+  --target_size     Fixed size in meters (random 0.6-1.5 if not set)
+  --size_jitter_frac  Size variation (default: 0.15)
 ```
